@@ -3,6 +3,7 @@
  */
 
 #include <math.h>
+#include <math_constants.h> // CUDA Math constants
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +223,21 @@ void destroy_frame(frame_ptr kill_me) {
 
 // --------------------- Project Code -----------------------
 
+// Force function inlining
+#ifdef _MSC_VER
+    #define forceinline __forceinline
+#elif defined(__GNUC__)
+    #define forceinline inline __attribute__((__always_inline__))
+#elif defined(__CLANG__)
+    #if __has_attribute(__always_inline__)
+        #define forceinline inline __attribute__((__always_inline__))
+    #else
+        #define forceinline inline
+    #endif
+#else
+    #define forceinline inline
+#endif
+
 #define BYTE_PER_KB 1024
 #define BYTE_PER_MB 1048576
 #define RUN_TEST 0 // Whether or not to test against uniprocessor
@@ -229,8 +245,7 @@ void destroy_frame(frame_ptr kill_me) {
 #define R_GRAYSCALE 0.2126
 #define G_GRAYSCALE 0.7152
 #define B_GRAYSCALE 0.0722
-#define PI 3.14159265358979323846
-#define TWO_PI (PI * 2)
+#define TWO_PI (CUDART_PI_F * 2)
 #define EIGEN_THRESHOLD 0.01
 
 /**
@@ -247,7 +262,8 @@ void checkFrameDim(frame_ptr f1, frame_ptr f2) {
 }
 
 /**
- * Makes sure values match in the two frames
+ * Makes sure values match in the two frames.
+ * If there is a difference of 1, ignore because of rounding error.
  */
 void checkResults(frame_ptr f1, frame_ptr f2) {
     checkFrameDim(f1, f2);
@@ -258,7 +274,7 @@ void checkResults(frame_ptr f1, frame_ptr f2) {
             for (k = 0; k < f1->num_channels; k++){
                 JSAMPLE j1 = f1->row_pointers[i][(f1->num_channels) * j + k];
                 JSAMPLE j2 = f2->row_pointers[i][(f2->num_channels) * j + k];
-                if (j1 != j2) {
+                if (abs(j1 - j2) > 1) {
                     fprintf(stderr, "Values do not match at (%d, %d, %d) \n", i, j, k);
                     fprintf(stderr, "in %d\n", j1);
                     fprintf(stderr, "to %d\n", j2);
@@ -275,8 +291,8 @@ void checkResults(frame_ptr f1, frame_ptr f2) {
  * Queries the properties of the GPU device with the given device_id,
  * fills it in the given device_prop, and print interesting info
  *
- * @device_prop The cuda device properties struct
- * @device_id The id of the gpu device
+ * @param device_prop The cuda device properties struct
+ * @param device_id The id of the gpu device
  */
 void query_device(cudaDeviceProp *device_prop, int device_id) {
     cudaGetDeviceProperties(device_prop, device_id);
@@ -322,8 +338,59 @@ inline __host__ __device__ float3 hsv2rgb(float h, float v) {
     return clamp(make_float3(R, G, B), 0.0f, 1.0f) * v;
 }
 
+/**
+ * Convert RGB to grayscale (betwene 0 and 1)
+ */
 inline __host__ __device__ float rgb2gray(unsigned char r, unsigned char g, unsigned char b) {
     return round(R_GRAYSCALE * r + G_GRAYSCALE * g + B_GRAYSCALE * b) / 255.0f;
+}
+
+/**
+ * Get angle in degrees [0, 360) from flow
+ */
+inline __host__ __device__ float get_angle(float2 flow) {
+    return fmodf((atan2f(flow.y, flow.x) + TWO_PI), TWO_PI) * 180.0f / CUDART_PI_F;
+}
+
+/**
+ * Get magnitude from flow
+ */
+inline __host__ __device__ float get_magnitude(float2 flow) {
+    return sqrt(flow.x * flow.x + flow.y * flow.y);
+}
+
+/**
+ * Calculate flow using (A^T A)^{-1} A^T b.
+ * @param AtA_00 The upper left entry of A^T A, corresponding to sum of (fx)^2
+ * @param AtA_01 The upper right/bottom left entry of A^T A, corresponding to sum of fx * fy
+ * @param AtA_11 The bottom right entry of A^T A, corresponding to sum of (fy)^2
+ * @param Atb_0 The top entry of A^T b, corresponding to sum of fx * ft
+ * @param Atb_1 The bottom entry of A^T b, corresponding to sum of fy * ft
+ * @return A float2 containing the flow
+ */
+inline __host__ __device__ float2 calc_flow_from_matrix(
+    float AtA_00, float AtA_01, float AtA_11, float Atb_0, float Atb_1
+) {
+     // Calculate determinant and make sure it is not 0 in order for the matrix to be invertible
+    float det = AtA_00 * AtA_11 - AtA_01 * AtA_01;
+    if (det == 0.0f) {
+        return make_float2(0.0f, 0.0f);
+    }
+
+    // Calculate the eigenvalues of A^T A and make sure they are > threshold
+    float trace_half = (AtA_00 + AtA_11) / 2.0f; // Half of the trace of A^T A
+    float delta = sqrt(trace_half * trace_half - det);
+    float eigen1 = trace_half + delta;
+    float eigen2 = trace_half - delta;
+    if (eigen1 <= EIGEN_THRESHOLD || eigen2 <= EIGEN_THRESHOLD) {
+        return make_float2(0.0f, 0.0f);
+    }
+
+    // Calculate flow components
+    return make_float2(
+        AtA_11 * Atb_0 - AtA_01 * Atb_1,
+        -AtA_01 * Atb_0 + AtA_00 * Atb_1
+    ) / det;
 }
 
 /**
@@ -342,6 +409,18 @@ float** alloc_2d_float_array(int height, int width) {
             fprintf(stderr, "ERROR: Memory allocation failure\n");
             exit(EXIT_FAILURE);
         }
+    }
+    return ptr;
+}
+
+/**
+ * Allocate a 1d array of length size, prefilled with 0
+ */
+float* alloc_1d_float_array(int size) {
+    float *ptr;
+    if ((ptr = (float *) calloc(1, size * sizeof(float))) == NULL) {
+        fprintf(stderr, "ERROR: Memory allocation failure\n");
+        exit(EXIT_FAILURE);
     }
     return ptr;
 }
@@ -392,6 +471,23 @@ float** get_normalized_2d_float_array(frame_ptr in) {
 }
 
 /**
+ * Flatten a heigh x width 2d array into a 1d array
+ */
+float* flatten_2d_float_array(float **src, int height, int width) {
+    float *arr;
+    if ((arr = (float *) malloc(height * width * sizeof(float))) == NULL) {
+        fprintf(stderr, "ERROR: Memory allocation failure\n");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int row = 0; row < height; row++) {
+        memcpy((void *) (arr + row * width), (void *) src[row], width * sizeof(float));
+    }
+
+    return arr;
+}
+
+/**
  * Pretty-print a 2d array for debugging purpose
  */
 void print_2d_float_array(float **arr, int height, int width) {
@@ -404,21 +500,76 @@ void print_2d_float_array(float **arr, int height, int width) {
 }
 
 /**
- * Calculate optical flow with Lucas-Kanade using CPU
+ * Pretty-print a 1d array as a 2d array for debugging purpose
+ */
+void print_1d_float_array_as_2d(float *arr, int height, int width) {
+    for (int row = 0; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            printf("%.2f ", arr[row * width + col]);
+        }
+        printf("\n");
+    }
+}
+
+/**
+ * Visualize the flow matrix using HSV and convert to RGB.
+ */
+frame_ptr create_flow_visualization(
+    float *angle, float *mag,
+    int height, int width, int s
+) {
+    float cur_mag, max_mag = -INFINITY, min_mag = INFINITY;
+    int row, col;
+
+    // Find min and max magnitude
+    for (row = s; row < height - s; row++) {
+        for (col = s; col < width - s; col++) {
+            cur_mag = mag[row * width + col];
+            if (cur_mag > max_mag) {
+                max_mag = cur_mag;
+            }
+            if (cur_mag < min_mag) {
+                min_mag = cur_mag;
+            }
+        }
+    }
+
+    frame_ptr out = allocate_frame(height, width, 3);
+    if (max_mag <= min_mag) {
+        return out;
+    }
+
+    JSAMPLE *cur_row;
+    max_mag -= min_mag;
+    for (row = s; row < height - s; row++) {
+        cur_row = out->row_pointers[row];
+
+        for (col = s; col < width - s; col++) {
+            float3 rgb = hsv2rgb(
+                angle[row * width + col], // Angle corresponds to Hue
+                clamp((mag[row * width + col] - min_mag) / max_mag, 0.0f, 1.0f) // Magnitude (scaled) corresponds to Value
+            );
+            cur_row[col * 3] = round(rgb.x * 255);
+            cur_row[col * 3 + 1] = round(rgb.y * 255);
+            cur_row[col * 3 + 2] = round(rgb.z * 255);
+        }
+    }
+
+    return out;
+}
+
+/**
+ * Calculate optical flow with Lucas-Kanade using CPU from 2 normalized frames
  *
- * @param raw_in1 Frame at time t
- * @param raw_in2 Frame at time t + 1
+ * @param in1 Frame at time t
+ * @param in2 Frame at time t + 1
  * @param window_size An odd positive integer >= 3 for the window size
  * @return A frame for visualizing the optical flow.
  */
-frame_ptr uniprocessor_lucas_kanade(frame_ptr raw_in1, frame_ptr raw_in2, int window_size) {
-    int height = raw_in1->image_height;
-    int width = raw_in1->image_width;
-
-    // Create 2d array of normalized image pixel between [0, 1]
-    float **in1 = get_normalized_2d_float_array(raw_in1);
-    float **in2 = get_normalized_2d_float_array(raw_in2);
-
+frame_ptr uniprocessor_lucas_kanade(
+    float **in1, float **in2,
+    int height, int width, int window_size
+) {
     // Calculate derivatives
     float **fx, **fy, **ft;
     fx = alloc_2d_float_array(height, width);
@@ -442,13 +593,10 @@ frame_ptr uniprocessor_lucas_kanade(frame_ptr raw_in1, frame_ptr raw_in2, int wi
 
     // Calculate flows
     int i, j;
-    float **angle, **mag;
-    angle = alloc_2d_float_array(height, width);
-    mag = alloc_2d_float_array(height, width);
-    float max_mag = -1.0f, min_mag = -1.0f;
-    float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1; // Entries of (A^T A)^-1 and A^T b
-    float det, trace_half, eigen1, eigen2, delta; // Determinant, trace (halved), eigenvalues of A^T A
-    float u, v; // Horizontal and vertical flow
+    float *angle = alloc_1d_float_array(height * width);
+    float *mag = alloc_1d_float_array(height * width);
+    float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1;
+    float2 flow;
     int s = window_size / 2;
 
     for (row = s; row < height - s; row++) {
@@ -464,74 +612,144 @@ frame_ptr uniprocessor_lucas_kanade(frame_ptr raw_in1, frame_ptr raw_in2, int wi
                 }
             }
 
-            // Make sure A^T A is invertible
-            det = AtA_00 * AtA_11 - AtA_01 * AtA_01;
-            if (det == 0.0f) {
-                continue;
-            }
-
-            // Make sure the eigenvalues are > threshold
-            trace_half = (AtA_00 + AtA_11) / 2.0f;
-            delta = sqrt(trace_half * trace_half - det);
-            eigen1 = trace_half + delta;
-            eigen2 = trace_half - delta;
-            if (eigen1 <= EIGEN_THRESHOLD || eigen2 <= EIGEN_THRESHOLD) {
-                continue;
-            }
-
-            // Calculate flow
-            u = (AtA_11 * Atb_0 - AtA_01 * Atb_1) / det;
-            v = (-AtA_01 * Atb_0 + AtA_00 * Atb_1) / det;
-            mag[row][col] = sqrt(u * u + v * v);
-            angle[row][col] = fmodf((atan2f(v, u) + TWO_PI), TWO_PI) * 180.0f / PI;
-
-            if (max_mag == -1.0f || mag[row][col] > max_mag) {
-                max_mag = mag[row][col];
-            }
-            if (min_mag == -1.0f || mag[row][col] < min_mag) {
-                min_mag = mag[row][col];
-            }
+            // Calculate flow and convert to polar coordinates
+            flow = calc_flow_from_matrix(AtA_00, AtA_01, AtA_11, Atb_0, Atb_1);
+            angle[row * width + col] = get_angle(flow);
+            mag[row * width + col] = get_magnitude(flow);
         }
     }
 
     // Create and write to output frame
-    frame_ptr out = allocate_frame(height, width, 3);
-    if (max_mag != min_mag) {
-        max_mag -= min_mag;
-        for (row = 0; row < height; row++) {
-            for (col = 0; col < width; col++) {
-                if (mag[row][col] == 0.0f) {
-                    continue;
-                }
+    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
 
-                mag[row][col] = clamp((mag[row][col] - min_mag) / max_mag, 0.0f, 1.0f);
-                float3 rgb = hsv2rgb(angle[row][col], mag[row][col]);
-                out->row_pointers[row][col * 3] = round(rgb.x * 255);
-                out->row_pointers[row][col * 3 + 1] = round(rgb.y * 255);
-                out->row_pointers[row][col * 3 + 2] = round(rgb.z * 255);
-            }
-        }
-    }
-
-    free_2d_float_array(in1, height);
-    free_2d_float_array(in2, height);
+    // Clean up
     free_2d_float_array(fx, height);
     free_2d_float_array(fy, height);
     free_2d_float_array(ft, height);
-    free_2d_float_array(angle, height);
-    free_2d_float_array(mag, height);
+    free(angle);
+    free(mag);
 
     return out;
 }
 
-// __global__
-// void naive_lucas_kanade(
-//     unsigned char* in1, unsigned char* in2, unsigned char* out,
-//     int height, int width, int num_channels
-// ) {
-//     int row = blockDim.y * blockIdx.y + threadIdx.y;
-//     int col = blockDim.x * blockIdx.x + threadIdx.x;
-// }
+__global__ void simple_derivative_kernel(
+    float *in1, float *in2,
+    float *fx, float *fy, float *ft,
+    int height, int width
+) {
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    if (row >= 0 && row < height && col >= 0 && col < width) {
+        int offset = row * width + col;
+        float top_left, top_mid, top_right, mid_left, mid_right, bottom_left, bottom_mid, bottom_right;
+
+        if (row > 0 && row < height - 1 && col > 0 && col < width - 1) {
+            top_left = in1[offset - width - 1];
+            top_mid = in1[offset - width];
+            top_right = in1[offset - width + 1];
+            bottom_left = in1[offset + width - 1];
+            bottom_mid = in1[offset + width];
+            bottom_right = in1[offset + width + 1];
+            mid_left = in1[offset - 1];
+            mid_right = in1[offset + 1];
+
+            fx[offset] = top_right - top_left + mid_right - mid_left + bottom_right - bottom_left;
+            fy[offset] = top_left - bottom_left + top_mid - bottom_mid + top_right - bottom_right;
+            ft[offset] = in2[offset] - in1[offset];
+        } else {
+            fx[offset] = fy[offset] = ft[offset] = 0.0f;
+        }
+    }
+}
+
+__global__ void simple_lucas_kanade_kernel(
+    float *fx, float *fy, float *ft,
+    float *angle, float *mag,
+    int height, int width, int s
+) {
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    if (row >= 0 && row < height && col >= 0 && col < width) {
+        if (row < s || row >= height - s || col < s || col >= width - s) {
+            angle[row * width + col] = mag[row * width + col] = 0.0f;
+        } else {
+            float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1; // Entries of (A^T A)^-1 and A^T b
+            float cur_fx, cur_fy, cur_ft;
+            AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
+
+            for (int i = row - s; i <= row + s; i++) {
+                for (int j = col - s; j <= col + s; j++) {
+                    cur_fx = fx[i * width + j];
+                    cur_fy = fy[i * width + j];
+                    cur_ft = ft[i * width + j];
+
+                    AtA_00 += cur_fx * cur_fx;
+                    AtA_11 += cur_fy * cur_fy;
+                    AtA_01 += cur_fx * cur_fy;
+                    Atb_0 -= cur_fx * cur_ft;
+                    Atb_1 -= cur_fy * cur_ft;
+                }
+            }
+
+            // Calculate flow and convert to polar coordinates
+            float2 flow = calc_flow_from_matrix(AtA_00, AtA_01, AtA_11, Atb_0, Atb_1);
+            angle[row * width + col] = get_angle(flow);
+            mag[row * width + col] = get_magnitude(flow);
+        }
+    }
+}
+
+frame_ptr run_kernel(
+    float **in1, float **in2,
+    int height, int width,
+    int window_size, int block_size
+) {
+    dim3 block_dim(block_size, block_size, 1);
+    dim3 grid_dim(ceil((float) width / block_size), ceil((float) height / block_size), 1);
+
+    int s = window_size / 2;
+    size_t size = height * width * sizeof(float);
+    float *flattened_in1, *flattened_in2, *angle, *mag;
+    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
+    flattened_in1 = flatten_2d_float_array(in1, height, width);
+    flattened_in2 = flatten_2d_float_array(in2, height, width);
+    angle = alloc_1d_float_array(size);
+    mag = alloc_1d_float_array(size);
+    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
+    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
+    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
+    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
+    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
+    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
+
+    simple_derivative_kernel<<<grid_dim, block_dim>>>(
+        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
+    );
+
+    simple_lucas_kanade_kernel<<<grid_dim, block_dim>>>(
+        d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s
+    );
+
+    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
+    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+
+    free(flattened_in1);
+    free(flattened_in2);
+    free(angle);
+    free(mag);
+    checkCudaErrors(cudaFree(d_fx));
+    checkCudaErrors(cudaFree(d_fy));
+    checkCudaErrors(cudaFree(d_ft));
+    checkCudaErrors(cudaFree(d_in1));
+    checkCudaErrors(cudaFree(d_in2));
+    checkCudaErrors(cudaFree(d_angle));
+    checkCudaErrors(cudaFree(d_mag));
+    return out;
+}
 
 /**
  * Host main routine
@@ -545,9 +763,9 @@ int main(int argc, char **argv) {
     }
 
     // Get inputs
-    frame_ptr in1 = read_JPEG_file(argv[2]);
-    frame_ptr in2 = read_JPEG_file(argv[3]);
-    checkFrameDim(in1, in2);
+    frame_ptr raw_in1 = read_JPEG_file(argv[2]);
+    frame_ptr raw_in2 = read_JPEG_file(argv[3]);
+    checkFrameDim(raw_in1, raw_in2);
 
     int window_size = atoi(argv[1]);
     if (window_size < 3 || window_size % 2 != 1) {
@@ -555,19 +773,31 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    frame_ptr out = uniprocessor_lucas_kanade(in1, in2, window_size);
+    // Create 2d array of normalized image pixel between [0, 1]
+    int height = raw_in1->image_height;
+    int width = raw_in2->image_width;
+    float **in1 = get_normalized_2d_float_array(raw_in1);
+    float **in2 = get_normalized_2d_float_array(raw_in2);
 
     // Get max block size from GPU's props
-    // int device_id = gpuGetMaxGflopsDeviceId();
-    // checkCudaErrors(cudaSetDevice(device_id));
-    // cudaDeviceProp device_prop;
-    // query_device(&device_prop, device_id);
-    // int max_block_size = (int) floor(sqrt(device_prop.maxThreadsPerBlock));
+    int device_id = gpuGetMaxGflopsDeviceId();
+    checkCudaErrors(cudaSetDevice(device_id));
+    cudaDeviceProp device_prop;
+    query_device(&device_prop, device_id);
+    int max_block_size = (int) floor(sqrt(device_prop.maxThreadsPerBlock));
+
+    // Run and test
+    frame_ptr out_gpu = run_kernel(in1, in2, height, width, window_size, max_block_size);
+    frame_ptr out_cpu = uniprocessor_lucas_kanade(in1, in2, height, width, window_size);
+    checkResults(out_gpu, out_cpu);
 
     // Write out the flows and clean up
-    write_JPEG_file(argv[4], out, JPEG_OUTPUT_QUALITY);
-    destroy_frame(in1);
-    destroy_frame(in2);
-    destroy_frame(out);
+    write_JPEG_file(argv[4], out_gpu, JPEG_OUTPUT_QUALITY);
+    destroy_frame(raw_in1);
+    destroy_frame(raw_in2);
+    free_2d_float_array(in1, height);
+    free_2d_float_array(in2, height);
+    destroy_frame(out_gpu);
+    destroy_frame(out_cpu);
     return 0;
 }

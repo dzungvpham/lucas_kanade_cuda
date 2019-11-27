@@ -360,6 +360,13 @@ inline __host__ __device__ float get_magnitude(float2 flow) {
 }
 
 /**
+ * Divide then take ceiling
+ */
+inline int divide_up(int a, int b) {
+    return (int) ceil(a / (float) b);
+}
+
+/**
  * Calculate flow using (A^T A)^{-1} A^T b.
  * @param AtA_00 The upper left entry of A^T A, corresponding to sum of (fx)^2
  * @param AtA_01 The upper right/bottom left entry of A^T A, corresponding to sum of fx * fy
@@ -639,7 +646,7 @@ __global__ void simple_derivative_kernel(
 ) {
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int col = blockDim.x * blockIdx.x + threadIdx.x;
-    if (row >= 0 && row < height && col >= 0 && col < width) {
+    if (row < height && col < width) {
         int offset = row * width + col;
         float top_left, top_mid, top_right, mid_left, mid_right, bottom_left, bottom_mid, bottom_right;
 
@@ -663,13 +670,12 @@ __global__ void simple_derivative_kernel(
 }
 
 __global__ void simple_lucas_kanade_kernel(
-    float *fx, float *fy, float *ft,
-    float *angle, float *mag,
+    float *fx, float *fy, float *ft, float *angle, float *mag,
     int height, int width, int s
 ) {
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int col = blockDim.x * blockIdx.x + threadIdx.x;
-    if (row >= 0 && row < height && col >= 0 && col < width) {
+    if (row < height && col < width) {
         if (row < s || row >= height - s || col < s || col >= width - s) {
             angle[row * width + col] = mag[row * width + col] = 0.0f;
         } else {
@@ -699,13 +705,13 @@ __global__ void simple_lucas_kanade_kernel(
     }
 }
 
-frame_ptr run_kernel(
+frame_ptr run_simple_kernel(
     float **in1, float **in2,
     int height, int width,
     int window_size, int block_size
 ) {
     dim3 block_dim(block_size, block_size, 1);
-    dim3 grid_dim(ceil((float) width / block_size), ceil((float) height / block_size), 1);
+    dim3 grid_dim(divide_up(width, block_size), divide_up(height, block_size), 1);
 
     int s = window_size / 2;
     size_t size = height * width * sizeof(float);
@@ -730,6 +736,97 @@ frame_ptr run_kernel(
     );
 
     simple_lucas_kanade_kernel<<<grid_dim, block_dim>>>(
+        d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s
+    );
+
+    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
+    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+
+    free(flattened_in1);
+    free(flattened_in2);
+    free(angle);
+    free(mag);
+    checkCudaErrors(cudaFree(d_fx));
+    checkCudaErrors(cudaFree(d_fy));
+    checkCudaErrors(cudaFree(d_ft));
+    checkCudaErrors(cudaFree(d_in1));
+    checkCudaErrors(cudaFree(d_in2));
+    checkCudaErrors(cudaFree(d_angle));
+    checkCudaErrors(cudaFree(d_mag));
+    return out;
+}
+
+__global__ void simple_lucas_kanade_kernel_2(
+    float *fx, float *fy, float *ft, float *angle, float *mag,
+    int height, int width, int s
+) {
+    int row = blockDim.y * blockIdx.y + threadIdx.y + s;
+    int col = blockDim.x * blockIdx.x + threadIdx.x + s;
+    if (row < height - s && col < width - s) {
+        float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1; // Entries of (A^T A)^-1 and A^T b
+        float cur_fx, cur_fy, cur_ft;
+        AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
+
+        for (int i = row - s; i <= row + s; i++) {
+            for (int j = col - s; j <= col + s; j++) {
+                cur_fx = fx[i * width + j];
+                cur_fy = fy[i * width + j];
+                cur_ft = ft[i * width + j];
+
+                AtA_00 += cur_fx * cur_fx;
+                AtA_11 += cur_fy * cur_fy;
+                AtA_01 += cur_fx * cur_fy;
+                Atb_0 -= cur_fx * cur_ft;
+                Atb_1 -= cur_fy * cur_ft;
+            }
+        }
+
+        // Calculate flow and convert to polar coordinates
+        float2 flow = calc_flow_from_matrix(AtA_00, AtA_01, AtA_11, Atb_0, Atb_1);
+        angle[row * width + col] = get_angle(flow);
+        mag[row * width + col] = get_magnitude(flow);
+    }
+}
+
+frame_ptr run_simple_kernel_2(
+    float **in1, float **in2,
+    int height, int width,
+    int window_size, int block_size
+) {
+    int out_width = width - window_size + 1;
+    int out_height = height - window_size + 1;
+    dim3 block_dim(block_size, block_size, 1);
+    dim3 derivative_grid_dim(divide_up(width, block_size), divide_up(height, block_size), 1);
+    dim3 flow_grid_dim(divide_up(out_width, block_size), divide_up(out_height, block_size), 1);
+
+    int s = window_size / 2;
+    size_t size = height * width * sizeof(float);
+    float *flattened_in1, *flattened_in2, *angle, *mag;
+    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
+
+    flattened_in1 = flatten_2d_float_array(in1, height, width);
+    flattened_in2 = flatten_2d_float_array(in2, height, width);
+    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
+    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
+    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
+    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
+
+    simple_derivative_kernel<<<derivative_grid_dim, block_dim>>>(
+        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
+    );
+
+    angle = alloc_1d_float_array(size);
+    mag = alloc_1d_float_array(size);
+    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
+    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
+    checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
+    checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
+
+    simple_lucas_kanade_kernel_2<<<flow_grid_dim, block_dim>>>(
         d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s
     );
 
@@ -787,7 +884,7 @@ int main(int argc, char **argv) {
     int max_block_size = (int) floor(sqrt(device_prop.maxThreadsPerBlock));
 
     // Run and test
-    frame_ptr out_gpu = run_kernel(in1, in2, height, width, window_size, max_block_size);
+    frame_ptr out_gpu = run_simple_kernel_2(in1, in2, height, width, window_size, max_block_size);
     frame_ptr out_cpu = uniprocessor_lucas_kanade(in1, in2, height, width, window_size);
     checkResults(out_gpu, out_cpu);
 

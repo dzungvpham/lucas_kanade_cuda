@@ -247,6 +247,7 @@ void destroy_frame(frame_ptr kill_me) {
 #define B_GRAYSCALE 0.0722
 #define TWO_PI (CUDART_PI_F * 2)
 #define EIGEN_THRESHOLD 0.01
+#define NUM_RUN 10
 
 /**
  * Makes sure the two input frames have the same dimensions
@@ -521,8 +522,8 @@ void print_1d_float_array_as_2d(float *arr, int height, int width) {
 /**
  * Visualize the flow matrix using HSV and convert to RGB.
  */
-frame_ptr create_flow_visualization(
-    float *angle, float *mag,
+void create_flow_visualization(
+    frame_ptr out, float *angle, float *mag,
     int height, int width, int s
 ) {
     float cur_mag, max_mag = -INFINITY, min_mag = INFINITY;
@@ -540,10 +541,8 @@ frame_ptr create_flow_visualization(
             }
         }
     }
-
-    frame_ptr out = allocate_frame(height, width, 3);
     if (max_mag <= min_mag) {
-        return out;
+        return;
     }
 
     JSAMPLE *cur_row;
@@ -561,8 +560,6 @@ frame_ptr create_flow_visualization(
             cur_row[col * 3 + 2] = round(rgb.z * 255);
         }
     }
-
-    return out;
 }
 
 /**
@@ -573,8 +570,8 @@ frame_ptr create_flow_visualization(
  * @param window_size An odd positive integer >= 3 for the window size
  * @return A frame for visualizing the optical flow.
  */
-frame_ptr uniprocessor_lucas_kanade(
-    float **in1, float **in2,
+void uniprocessor_lucas_kanade(
+    float **in1, float **in2, frame_ptr out,
     int height, int width, int window_size
 ) {
     // Calculate derivatives
@@ -627,7 +624,7 @@ frame_ptr uniprocessor_lucas_kanade(
     }
 
     // Create and write to output frame
-    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+    create_flow_visualization(out, angle, mag, height, width, s);
 
     // Clean up
     free_2d_float_array(fx, height);
@@ -635,8 +632,6 @@ frame_ptr uniprocessor_lucas_kanade(
     free_2d_float_array(ft, height);
     free(angle);
     free(mag);
-
-    return out;
 }
 
 __global__ void simple_derivative_kernel(
@@ -705,8 +700,8 @@ __global__ void simple_lucas_kanade_kernel(
     }
 }
 
-frame_ptr run_simple_kernel(
-    float **in1, float **in2,
+void run_simple_kernel(
+    float **in1, float **in2, frame_ptr out,
     int height, int width,
     int window_size, int block_size
 ) {
@@ -742,7 +737,7 @@ frame_ptr run_simple_kernel(
 
     checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+    create_flow_visualization(out, angle, mag, height, width, s);
 
     free(flattened_in1);
     free(flattened_in2);
@@ -755,7 +750,6 @@ frame_ptr run_simple_kernel(
     checkCudaErrors(cudaFree(d_in2));
     checkCudaErrors(cudaFree(d_angle));
     checkCudaErrors(cudaFree(d_mag));
-    return out;
 }
 
 __global__ void simple_lucas_kanade_kernel_2(
@@ -790,8 +784,8 @@ __global__ void simple_lucas_kanade_kernel_2(
     }
 }
 
-frame_ptr run_simple_kernel_2(
-    float **in1, float **in2,
+void run_simple_kernel_2(
+    float **in1, float **in2, frame_ptr out,
     int height, int width,
     int window_size, int block_size
 ) {
@@ -833,7 +827,7 @@ frame_ptr run_simple_kernel_2(
 
     checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+    create_flow_visualization(out, angle, mag, height, width, s);
 
     free(flattened_in1);
     free(flattened_in2);
@@ -846,7 +840,6 @@ frame_ptr run_simple_kernel_2(
     checkCudaErrors(cudaFree(d_in2));
     checkCudaErrors(cudaFree(d_angle));
     checkCudaErrors(cudaFree(d_mag));
-    return out;
 }
 
 // ----- Tiled kernel -----
@@ -921,8 +914,8 @@ __global__ void tiled_lucas_kanade_kernel(
     }
 }
 
-frame_ptr run_tiled_kernel(
-    float **in1, float **in2,
+void run_tiled_kernel(
+    float **in1, float **in2, frame_ptr out,
     int height, int width,
     int window_size, int out_block_size, int max_threads_per_block
 ) {
@@ -972,7 +965,7 @@ frame_ptr run_tiled_kernel(
 
     checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+    create_flow_visualization(out, angle, mag, height, width, s);
 
     free(flattened_in1);
     free(flattened_in2);
@@ -985,7 +978,6 @@ frame_ptr run_tiled_kernel(
     checkCudaErrors(cudaFree(d_in2));
     checkCudaErrors(cudaFree(d_angle));
     checkCudaErrors(cudaFree(d_mag));
-    return out;
 }
 
 size_t calc_max_window_size(cudaDeviceProp *device_prop, int out_block_size) {
@@ -1037,9 +1029,18 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    // Run and test
-    frame_ptr out_gpu = run_tiled_kernel(in1, in2, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
-    frame_ptr out_cpu = uniprocessor_lucas_kanade(in1, in2, height, width, window_size);
+    // Run several times for the profiler
+    frame_ptr out_gpu = allocate_frame(height, width, 3);
+    frame_ptr out_cpu = allocate_frame(height, width, 3);
+
+    for (int i = 0; i < NUM_RUN; i++) {
+        run_simple_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size);
+        run_simple_kernel_2(in1, in2, out_gpu, height, width, window_size, max_block_size);
+        run_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
+    }
+
+    // Test against CPU version
+    uniprocessor_lucas_kanade(in1, in2, out_cpu, height, width, window_size);
     checkResults(out_gpu, out_cpu);
 
     // Write out the flows and clean up

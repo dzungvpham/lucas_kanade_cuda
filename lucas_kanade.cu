@@ -362,7 +362,7 @@ inline __host__ __device__ float get_magnitude(float2 flow) {
 /**
  * Divide then take ceiling
  */
-inline int divide_up(int a, int b) {
+inline __host__ __device__ int divide_up(int a, int b) {
     return (int) ceil(a / (float) b);
 }
 
@@ -712,8 +712,9 @@ frame_ptr run_simple_kernel(
 ) {
     dim3 block_dim(block_size, block_size, 1);
     dim3 grid_dim(divide_up(width, block_size), divide_up(height, block_size), 1);
-
     int s = window_size / 2;
+
+    // ALlocate mem
     size_t size = height * width * sizeof(float);
     float *flattened_in1, *flattened_in2, *angle, *mag;
     float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
@@ -799,12 +800,12 @@ frame_ptr run_simple_kernel_2(
     dim3 block_dim(block_size, block_size, 1);
     dim3 derivative_grid_dim(divide_up(width, block_size), divide_up(height, block_size), 1);
     dim3 flow_grid_dim(divide_up(out_width, block_size), divide_up(out_height, block_size), 1);
-
     int s = window_size / 2;
+
+    // Allocate mem
     size_t size = height * width * sizeof(float);
     float *flattened_in1, *flattened_in2, *angle, *mag;
     float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
-
     flattened_in1 = flatten_2d_float_array(in1, height, width);
     flattened_in2 = flatten_2d_float_array(in2, height, width);
     checkCudaErrors(cudaMalloc((void **) &d_fx, size));
@@ -848,6 +849,152 @@ frame_ptr run_simple_kernel_2(
     return out;
 }
 
+// ----- Tiled kernel -----
+
+/**
+ * blockDim.x is the tile's width, and its square is the number of floats
+ */
+__global__ void tiled_lucas_kanade_kernel(
+    float *fx, float *fy, float *ft, float *angle, float *mag,
+    int height, int width, int s, int out_block_size, int tile_height, int num_tile
+) {
+    // Get column for loading data
+    int cur_col = out_block_size * blockIdx.x + threadIdx.x;
+    if (cur_col >= width) {
+        return;
+    }
+
+    // Load data into shared mem tile by tile
+    extern __shared__ float shared_mem[]; // Contains fx, fy, ft
+    int offset;
+    int cur_row = out_block_size * blockIdx.y - tile_height + threadIdx.y;
+    int shared_mem_entries = blockDim.x * blockDim.x; // per array
+    for (int k = 0; k < num_tile; k++) {
+        cur_row += tile_height;
+        offset = (k * tile_height + threadIdx.y) * blockDim.x + threadIdx.x;
+        if (cur_row < height && (k * tile_height + threadIdx.y) < blockDim.x) {
+            shared_mem[offset] = fx[cur_row * width + cur_col];
+            shared_mem[shared_mem_entries + offset] = fy[cur_row * width + cur_col];
+            shared_mem[2 * shared_mem_entries + offset] = ft[cur_row * width + cur_col];
+        }
+    }
+
+    __syncthreads(); // Wait for memory loading
+
+    // Get rid of unnecessary threads based on column
+    if (threadIdx.x < s || threadIdx.x >= blockDim.x - s || cur_col >= width - s) {
+        return;
+    }
+
+    // Start calculating flow tile by tile
+    float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1; // Entries of (A^T A)^-1 and A^T b
+    float cur_fx, cur_fy, cur_ft;
+    int cur_block_row = threadIdx.y - tile_height;
+    cur_row = out_block_size * blockIdx.y - tile_height + threadIdx.y; // reset row
+
+    for (int k = 0; k < num_tile; k++) {
+        cur_row += tile_height;
+        cur_block_row += tile_height;
+
+        if (cur_block_row >= s && cur_block_row < blockDim.x - s && cur_row < height - s) {
+            AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
+            for (int row = cur_block_row - s; row <= cur_block_row + s; row++) {
+                for (int col = threadIdx.x - s; col <= threadIdx.x + s; col++) {
+                    offset = row * blockDim.x + col;
+                    cur_fx = shared_mem[offset];
+                    cur_fy = shared_mem[shared_mem_entries + offset];
+                    cur_ft = shared_mem[2 * shared_mem_entries + offset];
+
+                    AtA_00 += cur_fx * cur_fx;
+                    AtA_11 += cur_fy * cur_fy;
+                    AtA_01 += cur_fx * cur_fy;
+                    Atb_0 -= cur_fx * cur_ft;
+                    Atb_1 -= cur_fy * cur_ft;
+                }
+            }
+
+            // Calculate flow and convert to polar coordinates
+            float2 flow = calc_flow_from_matrix(AtA_00, AtA_01, AtA_11, Atb_0, Atb_1);
+            angle[cur_row * width + cur_col] = get_angle(flow);
+            mag[cur_row * width + cur_col] = get_magnitude(flow);
+        }
+    }
+}
+
+frame_ptr run_tiled_kernel(
+    float **in1, float **in2,
+    int height, int width,
+    int window_size, int out_block_size, int max_threads_per_block
+) {
+    // Grid and block dim for the derivative kernel
+    dim3 derivative_block_dim(out_block_size, out_block_size, 1);
+    dim3 derivative_grid_dim(divide_up(width, out_block_size), divide_up(height, out_block_size), 1);
+
+    // Grid, block dim, tile dim, and shared mem size for the tiled flow kernel
+    int in_block_size = out_block_size + window_size - 1;
+    int tile_height = min(in_block_size, max_threads_per_block / in_block_size);
+    int out_width = width - window_size + 1;
+    int out_height = height - window_size + 1;
+    dim3 flow_block_dim(in_block_size, tile_height, 1);
+    dim3 flow_grid_dim(divide_up(out_width, out_block_size), divide_up(out_height, out_block_size), 1);
+    size_t shared_mem_size = 3 * in_block_size * in_block_size * sizeof(float); // reserve shared mem for fx, fy, ft
+    int s = window_size / 2;
+    int num_tile = divide_up(in_block_size, tile_height);
+
+    // Allocate mem
+    size_t size = height * width * sizeof(float);
+    float *flattened_in1, *flattened_in2, *angle, *mag;
+    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
+    flattened_in1 = flatten_2d_float_array(in1, height, width);
+    flattened_in2 = flatten_2d_float_array(in2, height, width);
+    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
+    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
+    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
+    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
+
+    simple_derivative_kernel<<<derivative_grid_dim, derivative_block_dim>>>(
+        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
+    );
+
+    angle = alloc_1d_float_array(size);
+    mag = alloc_1d_float_array(size);
+    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
+    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
+    checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
+    checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
+
+    tiled_lucas_kanade_kernel<<<flow_grid_dim, flow_block_dim, shared_mem_size>>>(
+        d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s, out_block_size, tile_height, num_tile
+    );
+
+    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
+    frame_ptr out = create_flow_visualization(angle, mag, height, width, s);
+
+    free(flattened_in1);
+    free(flattened_in2);
+    free(angle);
+    free(mag);
+    checkCudaErrors(cudaFree(d_fx));
+    checkCudaErrors(cudaFree(d_fy));
+    checkCudaErrors(cudaFree(d_ft));
+    checkCudaErrors(cudaFree(d_in1));
+    checkCudaErrors(cudaFree(d_in2));
+    checkCudaErrors(cudaFree(d_angle));
+    checkCudaErrors(cudaFree(d_mag));
+    return out;
+}
+
+size_t calc_max_window_size(cudaDeviceProp *device_prop, int out_block_size) {
+    // Maximum number of floats per shared mem array (fx, fy, ft)
+    int max_float_num = device_prop->sharedMemPerBlock / sizeof(float) / 3;
+    int max_window_size = ((int) floor(sqrt(max_float_num))) - out_block_size + 1;
+    return max_window_size % 2 == 1 ? max_window_size : max_window_size - 1;
+}
+
 /**
  * Host main routine
  */
@@ -866,7 +1013,7 @@ int main(int argc, char **argv) {
 
     int window_size = atoi(argv[1]);
     if (window_size < 3 || window_size % 2 != 1) {
-        fprintf(stderr, "Window size must be an odd integer >= 3");
+        fprintf(stderr, "Window size must be an odd integer >= 3\n");
         exit(EXIT_FAILURE);
     }
 
@@ -883,8 +1030,15 @@ int main(int argc, char **argv) {
     query_device(&device_prop, device_id);
     int max_block_size = (int) floor(sqrt(device_prop.maxThreadsPerBlock));
 
+    // Check window size for tiling
+    int max_window_size = calc_max_window_size(&device_prop, max_block_size);
+    if (max_window_size < window_size) {
+        fprintf(stderr, "Window size must be at most %d\n", max_window_size);
+        exit(EXIT_FAILURE);
+    }
+
     // Run and test
-    frame_ptr out_gpu = run_simple_kernel_2(in1, in2, height, width, window_size, max_block_size);
+    frame_ptr out_gpu = run_tiled_kernel(in1, in2, height, width, window_size, max_window_size, device_prop.maxThreadsPerBlock);
     frame_ptr out_cpu = uniprocessor_lucas_kanade(in1, in2, height, width, window_size);
     checkResults(out_gpu, out_cpu);
 

@@ -1038,7 +1038,7 @@ int main(int argc, char **argv) {
     }
 
     // Run and test
-    frame_ptr out_gpu = run_tiled_kernel(in1, in2, height, width, window_size, max_window_size, device_prop.maxThreadsPerBlock);
+    frame_ptr out_gpu = run_tiled_kernel(in1, in2, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
     frame_ptr out_cpu = uniprocessor_lucas_kanade(in1, in2, height, width, window_size);
     checkResults(out_gpu, out_cpu);
 

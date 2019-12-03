@@ -284,8 +284,6 @@ void checkResults(frame_ptr f1, frame_ptr f2) {
             }
         }
     }
-
-    printf("Results are the same\n");
 }
 
 /**
@@ -634,6 +632,70 @@ void uniprocessor_lucas_kanade(
     free(mag);
 }
 
+void run_generic_cuda_kernel(
+    float **in1, float **in2, frame_ptr out,
+    int height, int width, int window_size,
+    dim3 derivative_grid_dim, dim3 derivative_block_dim,
+    dim3 flow_grid_dim, dim3 flow_block_dim,
+    void (*derivative_kernel_ptr)(float *, float *, float *, float *, float *, int, int),
+    void (*normal_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int),
+    void (*tiled_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int, int, int),
+    bool is_tiled, int out_block_size, size_t shared_mem_size,
+    int tile_height, int tile_width, int num_tile
+) {
+    int s = window_size / 2;
+    // Allocate mem
+    size_t size = height * width * sizeof(float);
+    float *flattened_in1, *flattened_in2, *angle, *mag;
+    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
+    flattened_in1 = flatten_2d_float_array(in1, height, width);
+    flattened_in2 = flatten_2d_float_array(in2, height, width);
+    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
+    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
+    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
+    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
+    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
+
+    derivative_kernel_ptr<<<derivative_grid_dim, derivative_block_dim>>>(
+        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
+    );
+
+    angle = alloc_1d_float_array(size);
+    mag = alloc_1d_float_array(size);
+    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
+    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
+    checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
+    checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
+
+    if (is_tiled) {
+        tiled_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim, shared_mem_size>>>(
+            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s, out_block_size, tile_height, num_tile
+        );
+    } else {
+        normal_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim>>>(
+            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s
+        );
+    }
+
+    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
+    create_flow_visualization(out, angle, mag, height, width, s);
+
+    free(flattened_in1);
+    free(flattened_in2);
+    free(angle);
+    free(mag);
+    checkCudaErrors(cudaFree(d_fx));
+    checkCudaErrors(cudaFree(d_fy));
+    checkCudaErrors(cudaFree(d_ft));
+    checkCudaErrors(cudaFree(d_in1));
+    checkCudaErrors(cudaFree(d_in2));
+    checkCudaErrors(cudaFree(d_angle));
+    checkCudaErrors(cudaFree(d_mag));
+}
+
 __global__ void simple_derivative_kernel(
     float *in1, float *in2,
     float *fx, float *fy, float *ft,
@@ -668,94 +730,6 @@ __global__ void simple_lucas_kanade_kernel(
     float *fx, float *fy, float *ft, float *angle, float *mag,
     int height, int width, int s
 ) {
-    int row = blockDim.y * blockIdx.y + threadIdx.y;
-    int col = blockDim.x * blockIdx.x + threadIdx.x;
-    if (row < height && col < width) {
-        if (row < s || row >= height - s || col < s || col >= width - s) {
-            angle[row * width + col] = mag[row * width + col] = 0.0f;
-        } else {
-            float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1; // Entries of (A^T A)^-1 and A^T b
-            float cur_fx, cur_fy, cur_ft;
-            AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
-
-            for (int i = row - s; i <= row + s; i++) {
-                for (int j = col - s; j <= col + s; j++) {
-                    cur_fx = fx[i * width + j];
-                    cur_fy = fy[i * width + j];
-                    cur_ft = ft[i * width + j];
-
-                    AtA_00 += cur_fx * cur_fx;
-                    AtA_11 += cur_fy * cur_fy;
-                    AtA_01 += cur_fx * cur_fy;
-                    Atb_0 -= cur_fx * cur_ft;
-                    Atb_1 -= cur_fy * cur_ft;
-                }
-            }
-
-            // Calculate flow and convert to polar coordinates
-            float2 flow = calc_flow_from_matrix(AtA_00, AtA_01, AtA_11, Atb_0, Atb_1);
-            angle[row * width + col] = get_angle(flow);
-            mag[row * width + col] = get_magnitude(flow);
-        }
-    }
-}
-
-void run_simple_kernel(
-    float **in1, float **in2, frame_ptr out,
-    int height, int width,
-    int window_size, int block_size
-) {
-    dim3 block_dim(block_size, block_size, 1);
-    dim3 grid_dim(divide_up(width, block_size), divide_up(height, block_size), 1);
-    int s = window_size / 2;
-
-    // ALlocate mem
-    size_t size = height * width * sizeof(float);
-    float *flattened_in1, *flattened_in2, *angle, *mag;
-    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
-    flattened_in1 = flatten_2d_float_array(in1, height, width);
-    flattened_in2 = flatten_2d_float_array(in2, height, width);
-    angle = alloc_1d_float_array(size);
-    mag = alloc_1d_float_array(size);
-    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
-    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
-    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
-    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
-    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
-    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
-    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
-    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
-
-    simple_derivative_kernel<<<grid_dim, block_dim>>>(
-        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
-    );
-
-    simple_lucas_kanade_kernel<<<grid_dim, block_dim>>>(
-        d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s
-    );
-
-    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    create_flow_visualization(out, angle, mag, height, width, s);
-
-    free(flattened_in1);
-    free(flattened_in2);
-    free(angle);
-    free(mag);
-    checkCudaErrors(cudaFree(d_fx));
-    checkCudaErrors(cudaFree(d_fy));
-    checkCudaErrors(cudaFree(d_ft));
-    checkCudaErrors(cudaFree(d_in1));
-    checkCudaErrors(cudaFree(d_in2));
-    checkCudaErrors(cudaFree(d_angle));
-    checkCudaErrors(cudaFree(d_mag));
-}
-
-__global__ void simple_lucas_kanade_kernel_2(
-    float *fx, float *fy, float *ft, float *angle, float *mag,
-    int height, int width, int s
-) {
     int row = blockDim.y * blockIdx.y + threadIdx.y + s;
     int col = blockDim.x * blockIdx.x + threadIdx.x + s;
     if (row < height - s && col < width - s) {
@@ -784,7 +758,7 @@ __global__ void simple_lucas_kanade_kernel_2(
     }
 }
 
-void run_simple_kernel_2(
+void run_simple_kernel(
     float **in1, float **in2, frame_ptr out,
     int height, int width,
     int window_size, int block_size
@@ -794,52 +768,13 @@ void run_simple_kernel_2(
     dim3 block_dim(block_size, block_size, 1);
     dim3 derivative_grid_dim(divide_up(width, block_size), divide_up(height, block_size), 1);
     dim3 flow_grid_dim(divide_up(out_width, block_size), divide_up(out_height, block_size), 1);
-    int s = window_size / 2;
 
-    // Allocate mem
-    size_t size = height * width * sizeof(float);
-    float *flattened_in1, *flattened_in2, *angle, *mag;
-    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
-    flattened_in1 = flatten_2d_float_array(in1, height, width);
-    flattened_in2 = flatten_2d_float_array(in2, height, width);
-    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
-    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
-    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
-    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
-    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
-    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
-
-    simple_derivative_kernel<<<derivative_grid_dim, block_dim>>>(
-        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
+    run_generic_cuda_kernel(
+        in1, in2, out, height, width, window_size,
+        derivative_grid_dim, block_dim, flow_grid_dim, block_dim,
+        simple_derivative_kernel, simple_lucas_kanade_kernel, NULL, false,
+        0, 0, 0, 0, 0
     );
-
-    angle = alloc_1d_float_array(size);
-    mag = alloc_1d_float_array(size);
-    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
-    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
-    checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
-    checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
-
-    simple_lucas_kanade_kernel_2<<<flow_grid_dim, block_dim>>>(
-        d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s
-    );
-
-    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    create_flow_visualization(out, angle, mag, height, width, s);
-
-    free(flattened_in1);
-    free(flattened_in2);
-    free(angle);
-    free(mag);
-    checkCudaErrors(cudaFree(d_fx));
-    checkCudaErrors(cudaFree(d_fy));
-    checkCudaErrors(cudaFree(d_ft));
-    checkCudaErrors(cudaFree(d_in1));
-    checkCudaErrors(cudaFree(d_in2));
-    checkCudaErrors(cudaFree(d_angle));
-    checkCudaErrors(cudaFree(d_mag));
 }
 
 // ----- Tiled kernel -----
@@ -861,14 +796,13 @@ __global__ void tiled_lucas_kanade_kernel(
     extern __shared__ float shared_mem[]; // Contains fx, fy, ft
     int offset;
     int cur_row = out_block_size * blockIdx.y - tile_height + threadIdx.y;
-    int shared_mem_entries = blockDim.x * blockDim.x; // per array
     for (int k = 0; k < num_tile; k++) {
         cur_row += tile_height;
-        offset = (k * tile_height + threadIdx.y) * blockDim.x + threadIdx.x;
+        offset = 3 * ((k * tile_height + threadIdx.y) * blockDim.x + threadIdx.x);
         if (cur_row < height && (k * tile_height + threadIdx.y) < blockDim.x) {
             shared_mem[offset] = fx[cur_row * width + cur_col];
-            shared_mem[shared_mem_entries + offset] = fy[cur_row * width + cur_col];
-            shared_mem[2 * shared_mem_entries + offset] = ft[cur_row * width + cur_col];
+            shared_mem[offset + 1] = fy[cur_row * width + cur_col];
+            shared_mem[offset + 2] = ft[cur_row * width + cur_col];
         }
     }
 
@@ -893,10 +827,10 @@ __global__ void tiled_lucas_kanade_kernel(
             AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
             for (int row = cur_block_row - s; row <= cur_block_row + s; row++) {
                 for (int col = threadIdx.x - s; col <= threadIdx.x + s; col++) {
-                    offset = row * blockDim.x + col;
+                    offset = 3 * (row * blockDim.x + col);
                     cur_fx = shared_mem[offset];
-                    cur_fy = shared_mem[shared_mem_entries + offset];
-                    cur_ft = shared_mem[2 * shared_mem_entries + offset];
+                    cur_fy = shared_mem[offset + 1];
+                    cur_ft = shared_mem[offset + 2];
 
                     AtA_00 += cur_fx * cur_fx;
                     AtA_11 += cur_fy * cur_fy;
@@ -931,53 +865,14 @@ void run_tiled_kernel(
     dim3 flow_block_dim(in_block_size, tile_height, 1);
     dim3 flow_grid_dim(divide_up(out_width, out_block_size), divide_up(out_height, out_block_size), 1);
     size_t shared_mem_size = 3 * in_block_size * in_block_size * sizeof(float); // reserve shared mem for fx, fy, ft
-    int s = window_size / 2;
     int num_tile = divide_up(in_block_size, tile_height);
 
-    // Allocate mem
-    size_t size = height * width * sizeof(float);
-    float *flattened_in1, *flattened_in2, *angle, *mag;
-    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
-    flattened_in1 = flatten_2d_float_array(in1, height, width);
-    flattened_in2 = flatten_2d_float_array(in2, height, width);
-    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
-    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
-    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
-    checkCudaErrors(cudaMalloc((void **) &d_in1, size));
-    checkCudaErrors(cudaMalloc((void **) &d_in2, size));
-    checkCudaErrors(cudaMemcpy(d_in1, flattened_in1, size, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_in2, flattened_in2, size, cudaMemcpyHostToDevice));
-
-    simple_derivative_kernel<<<derivative_grid_dim, derivative_block_dim>>>(
-        d_in1, d_in2, d_fx, d_fy, d_ft, height, width
+    run_generic_cuda_kernel(
+        in1, in2, out, height, width, window_size,
+        derivative_grid_dim, derivative_block_dim, flow_grid_dim, flow_block_dim,
+        simple_derivative_kernel, NULL, tiled_lucas_kanade_kernel, true,
+        out_block_size, shared_mem_size, tile_height, in_block_size, num_tile
     );
-
-    angle = alloc_1d_float_array(size);
-    mag = alloc_1d_float_array(size);
-    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
-    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
-    checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
-    checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
-
-    tiled_lucas_kanade_kernel<<<flow_grid_dim, flow_block_dim, shared_mem_size>>>(
-        d_fx, d_fy, d_ft, d_angle, d_mag, height, width, s, out_block_size, tile_height, num_tile
-    );
-
-    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    create_flow_visualization(out, angle, mag, height, width, s);
-
-    free(flattened_in1);
-    free(flattened_in2);
-    free(angle);
-    free(mag);
-    checkCudaErrors(cudaFree(d_fx));
-    checkCudaErrors(cudaFree(d_fy));
-    checkCudaErrors(cudaFree(d_ft));
-    checkCudaErrors(cudaFree(d_in1));
-    checkCudaErrors(cudaFree(d_in2));
-    checkCudaErrors(cudaFree(d_angle));
-    checkCudaErrors(cudaFree(d_mag));
 }
 
 size_t calc_max_window_size(cudaDeviceProp *device_prop, int out_block_size) {
@@ -1029,21 +924,22 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    // Run several times for the profiler
+    // Allocate output frames
     frame_ptr out_gpu = allocate_frame(height, width, 3);
     frame_ptr out_cpu = allocate_frame(height, width, 3);
 
+    // Run CPU version
+    uniprocessor_lucas_kanade(in1, in2, out_cpu, height, width, window_size);
+
+    // Run GPU version several times for profiler while also testing against CPU version
     for (int i = 0; i < NUM_RUN; i++) {
         run_simple_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size);
-        run_simple_kernel_2(in1, in2, out_gpu, height, width, window_size, max_block_size);
+        checkResults(out_gpu, out_cpu);
         run_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
+        checkResults(out_gpu, out_cpu);
     }
 
-    // Test against CPU version
-    uniprocessor_lucas_kanade(in1, in2, out_cpu, height, width, window_size);
-    checkResults(out_gpu, out_cpu);
-
-    // Write out the flows and clean up
+    // Write out the visualization and clean up
     write_JPEG_file(argv[4], out_gpu, JPEG_OUTPUT_QUALITY);
     destroy_frame(raw_in1);
     destroy_frame(raw_in2);

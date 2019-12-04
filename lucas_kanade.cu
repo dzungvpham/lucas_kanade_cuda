@@ -882,9 +882,199 @@ size_t calc_max_window_size(cudaDeviceProp *device_prop, int out_block_size) {
     return max_window_size % 2 == 1 ? max_window_size : max_window_size - 1;
 }
 
-/**
- * Host main routine
- */
+// ------------ Pitched kernel -------------
+
+void run_generic_pitched_cuda_kernel(
+    float **in1, float **in2, frame_ptr out,
+    int height, int width, int window_size,
+    dim3 derivative_grid_dim, dim3 derivative_block_dim,
+    dim3 flow_grid_dim, dim3 flow_block_dim,
+    void (*derivative_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int),
+    void (*normal_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int),
+    void (*tiled_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int, int, int, int),
+    bool is_tiled, int out_block_size, size_t shared_mem_size,
+    int tile_height, int tile_width, int num_tile
+) {
+    int s = window_size / 2;
+    // Allocate mem
+    size_t pitch;
+    size_t width_in_bytes = width * sizeof(float);
+    float *flattened_in1, *flattened_in2, *angle, *mag;
+    float *d_in1, *d_in2, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
+    flattened_in1 = flatten_2d_float_array(in1, height, width);
+    flattened_in2 = flatten_2d_float_array(in2, height, width);
+    checkCudaErrors(cudaMallocPitch((void **) &d_fx, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMallocPitch((void **) &d_fy, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMallocPitch((void **) &d_ft, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMallocPitch((void **) &d_in1, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMallocPitch((void **) &d_in2, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMemcpy2D(d_in1, pitch, flattened_in1, width_in_bytes, width_in_bytes, height, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaMemcpy2D(d_in2, pitch, flattened_in2, width_in_bytes, width_in_bytes, height, cudaMemcpyHostToDevice));
+    int pitch_float = divide_up((int) pitch, (int) sizeof(float)); // number of pictched floats
+
+    derivative_kernel_ptr<<<derivative_grid_dim, derivative_block_dim>>>(
+        d_in1, d_in2, d_fx, d_fy, d_ft, height, width, pitch_float
+    );
+
+    angle = alloc_1d_float_array(height * width_in_bytes);
+    mag = alloc_1d_float_array(height * width_in_bytes);
+    checkCudaErrors(cudaMallocPitch((void **) &d_angle, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMallocPitch((void **) &d_mag, &pitch, width_in_bytes, height));
+    checkCudaErrors(cudaMemset((void *) d_angle, 0, height * pitch));
+    checkCudaErrors(cudaMemset((void *) d_mag, 0, height * pitch));
+
+    if (is_tiled) {
+        tiled_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim, shared_mem_size>>>(
+            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, pitch_float, s, out_block_size, tile_height, num_tile
+        );
+    } else {
+        normal_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim>>>(
+            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, pitch_float, s
+        );
+    }
+
+    checkCudaErrors(cudaMemcpy2D(angle, width_in_bytes, d_angle, pitch, width_in_bytes, height, cudaMemcpyDeviceToHost));
+    checkCudaErrors(cudaMemcpy2D(mag, width_in_bytes, d_mag, pitch, width_in_bytes, height, cudaMemcpyDeviceToHost));
+    create_flow_visualization(out, angle, mag, height, width, s);
+
+    free(flattened_in1);
+    free(flattened_in2);
+    free(angle);
+    free(mag);
+    checkCudaErrors(cudaFree(d_fx));
+    checkCudaErrors(cudaFree(d_fy));
+    checkCudaErrors(cudaFree(d_ft));
+    checkCudaErrors(cudaFree(d_in1));
+    checkCudaErrors(cudaFree(d_in2));
+    checkCudaErrors(cudaFree(d_angle));
+    checkCudaErrors(cudaFree(d_mag));
+}
+
+__global__ void pitched_derivative_kernel(
+    float *in1, float *in2,
+    float *fx, float *fy, float *ft,
+    int height, int width, int pitch
+) {
+    int row = blockDim.y * blockIdx.y + threadIdx.y;
+    int col = blockDim.x * blockIdx.x + threadIdx.x;
+    if (row < height && col < width) {
+        int offset = row * pitch + col;
+        float top_left, top_mid, top_right, mid_left, mid_right, bottom_left, bottom_mid, bottom_right;
+
+        if (row > 0 && row < height - 1 && col > 0 && col < width - 1) {
+            top_left = in1[offset - pitch - 1];
+            top_mid = in1[offset - pitch];
+            top_right = in1[offset - pitch + 1];
+            bottom_left = in1[offset + pitch - 1];
+            bottom_mid = in1[offset + pitch];
+            bottom_right = in1[offset + pitch + 1];
+            mid_left = in1[offset - 1];
+            mid_right = in1[offset + 1];
+
+            fx[offset] = top_right - top_left + mid_right - mid_left + bottom_right - bottom_left;
+            fy[offset] = top_left - bottom_left + top_mid - bottom_mid + top_right - bottom_right;
+            ft[offset] = in2[offset] - in1[offset];
+        } else {
+            fx[offset] = fy[offset] = ft[offset] = 0.0f;
+        }
+    }
+}
+
+__global__ void pitched_tiled_lucas_kanade_kernel(
+    float *fx, float *fy, float *ft, float *angle, float *mag,
+    int height, int width, int pitch, int s, int out_block_size, int tile_height, int num_tile
+) {
+    // Get column for loading data
+    int cur_col = out_block_size * blockIdx.x + threadIdx.x;
+    if (cur_col >= width) {
+        return;
+    }
+
+    // Load data into shared mem tile by tile
+    extern __shared__ float shared_mem[]; // Contains fx, fy, ft
+    int offset;
+    int cur_row = out_block_size * blockIdx.y - tile_height + threadIdx.y;
+    for (int k = 0; k < num_tile; k++) {
+        cur_row += tile_height;
+        offset = 3 * ((k * tile_height + threadIdx.y) * blockDim.x + threadIdx.x);
+        if (cur_row < height && (k * tile_height + threadIdx.y) < blockDim.x) {
+            shared_mem[offset] = fx[cur_row * pitch + cur_col];
+            shared_mem[offset + 1] = fy[cur_row * pitch + cur_col];
+            shared_mem[offset + 2] = ft[cur_row * pitch + cur_col];
+        }
+    }
+
+    __syncthreads(); // Wait for memory loading
+
+    // Get rid of unnecessary threads based on column
+    if (threadIdx.x < s || threadIdx.x >= blockDim.x - s || cur_col >= width - s) {
+        return;
+    }
+
+    // Start calculating flow tile by tile
+    float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1; // Entries of (A^T A)^-1 and A^T b
+    float cur_fx, cur_fy, cur_ft;
+    int cur_block_row = threadIdx.y - tile_height;
+    cur_row = out_block_size * blockIdx.y - tile_height + threadIdx.y; // reset row
+
+    for (int k = 0; k < num_tile; k++) {
+        cur_row += tile_height;
+        cur_block_row += tile_height;
+
+        if (cur_block_row >= s && cur_block_row < blockDim.x - s && cur_row < height - s) {
+            AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
+            for (int row = cur_block_row - s; row <= cur_block_row + s; row++) {
+                for (int col = threadIdx.x - s; col <= threadIdx.x + s; col++) {
+                    offset = 3 * (row * blockDim.x + col);
+                    cur_fx = shared_mem[offset];
+                    cur_fy = shared_mem[offset + 1];
+                    cur_ft = shared_mem[offset + 2];
+
+                    AtA_00 += cur_fx * cur_fx;
+                    AtA_11 += cur_fy * cur_fy;
+                    AtA_01 += cur_fx * cur_fy;
+                    Atb_0 -= cur_fx * cur_ft;
+                    Atb_1 -= cur_fy * cur_ft;
+                }
+            }
+
+            // Calculate flow and convert to polar coordinates
+            float2 flow = calc_flow_from_matrix(AtA_00, AtA_01, AtA_11, Atb_0, Atb_1);
+            angle[cur_row * pitch + cur_col] = get_angle(flow);
+            mag[cur_row * pitch + cur_col] = get_magnitude(flow);
+        }
+    }
+}
+
+void run_pitched_tiled_kernel(
+    float **in1, float **in2, frame_ptr out,
+    int height, int width,
+    int window_size, int out_block_size, int max_threads_per_block
+) {
+    // Grid and block dim for the derivative kernel
+    dim3 derivative_block_dim(out_block_size, out_block_size, 1);
+    dim3 derivative_grid_dim(divide_up(width, out_block_size), divide_up(height, out_block_size), 1);
+
+    // Grid, block dim, tile dim, and shared mem size for the tiled flow kernel
+    int in_block_size = out_block_size + window_size - 1;
+    int tile_height = min(in_block_size, max_threads_per_block / in_block_size);
+    int out_width = width - window_size + 1;
+    int out_height = height - window_size + 1;
+    dim3 flow_block_dim(in_block_size, tile_height, 1);
+    dim3 flow_grid_dim(divide_up(out_width, out_block_size), divide_up(out_height, out_block_size), 1);
+    size_t shared_mem_size = 3 * in_block_size * in_block_size * sizeof(float); // reserve shared mem for fx, fy, ft
+    int num_tile = divide_up(in_block_size, tile_height);
+
+    run_generic_pitched_cuda_kernel(
+        in1, in2, out, height, width, window_size,
+        derivative_grid_dim, derivative_block_dim, flow_grid_dim, flow_block_dim,
+        pitched_derivative_kernel, NULL, pitched_tiled_lucas_kanade_kernel, true,
+        out_block_size, shared_mem_size, tile_height, in_block_size, num_tile
+    );
+}
+
+// ----------- Host main --------------
+
 int main(int argc, char **argv) {
     if (argc != 5) {
         fprintf(stderr,
@@ -936,6 +1126,8 @@ int main(int argc, char **argv) {
         run_simple_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size);
         checkResults(out_gpu, out_cpu);
         run_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
+        checkResults(out_gpu, out_cpu);
+        run_pitched_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
         checkResults(out_gpu, out_cpu);
     }
 

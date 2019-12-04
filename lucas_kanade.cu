@@ -1180,29 +1180,12 @@ void run_pitched_tiled_kernel(
 // ----------- Host main --------------
 
 int main(int argc, char **argv) {
-    if (argc != 5) {
+    if (argc != 6) {
         fprintf(stderr,
-            "Usage: lucas_kanade <WINDOW_SIZE>"
+            "Usage: lucas_kanade <WINDOW_SIZE> <BLOCK_SIZE>"
             " <PATH_TO_FRAME_1> <PATH_TO_FRAME_2> <PATH_TO_FLOW_OUTPUT>\n");
         exit(EXIT_FAILURE);
     }
-
-    // Get inputs
-    frame_ptr raw_in1 = read_JPEG_file(argv[2]);
-    frame_ptr raw_in2 = read_JPEG_file(argv[3]);
-    checkFrameDim(raw_in1, raw_in2);
-
-    int window_size = atoi(argv[1]);
-    if (window_size < 3 || window_size % 2 != 1) {
-        fprintf(stderr, "Window size must be an odd integer >= 3\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Create 2d array of normalized image pixel between [0, 1]
-    int height = raw_in1->image_height;
-    int width = raw_in2->image_width;
-    float **in1 = get_normalized_2d_float_array(raw_in1);
-    float **in2 = get_normalized_2d_float_array(raw_in2);
 
     // Get max block size from GPU's props
     int device_id = gpuGetMaxGflopsDeviceId();
@@ -1211,12 +1194,39 @@ int main(int argc, char **argv) {
     query_device(&device_prop, device_id);
     int max_block_size = (int) floor(sqrt(device_prop.maxThreadsPerBlock));
 
+    // Get inputs
+    int window_size = atoi(argv[1]);
+    if (window_size < 3 || window_size % 2 != 1) {
+        fprintf(stderr, "Window size must be an odd integer >= 3\n");
+        exit(EXIT_FAILURE);
+    }
+
     // Check window size for tiling
     int max_window_size = calc_max_window_size(&device_prop, max_block_size);
     if (max_window_size < window_size) {
-        fprintf(stderr, "Window size must be at most %d\n", max_window_size);
+        fprintf(stderr, "Window size must be <= %d\n", max_window_size);
         exit(EXIT_FAILURE);
     }
+
+    // Check block size
+    int block_size = atoi(argv[2]);
+    if (block_size > max_block_size) {
+        fprintf(stderr, "Block size must be <= %d\n", max_block_size);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Running with block size %d and window size %d\n", block_size, window_size);
+
+    // Check input frames
+    frame_ptr raw_in1 = read_JPEG_file(argv[3]);
+    frame_ptr raw_in2 = read_JPEG_file(argv[4]);
+    checkFrameDim(raw_in1, raw_in2);
+
+    // Create 2d array of normalized image pixel between [0, 1]
+    int height = raw_in1->image_height;
+    int width = raw_in2->image_width;
+    float **in1 = get_normalized_2d_float_array(raw_in1);
+    float **in2 = get_normalized_2d_float_array(raw_in2);
 
     // Allocate output frames
     frame_ptr out_gpu = allocate_frame(height, width, 3);
@@ -1227,18 +1237,18 @@ int main(int argc, char **argv) {
 
     // Run GPU version several times for profiler while also testing against CPU version
     for (int i = 0; i < NUM_RUN; i++) {
-        run_simple_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size);
+        run_simple_kernel(in1, in2, out_gpu, height, width, window_size, block_size);
         checkResults(out_gpu, out_cpu);
-        run_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
+        run_tiled_kernel(in1, in2, out_gpu, height, width, window_size, block_size, device_prop.maxThreadsPerBlock);
         checkResults(out_gpu, out_cpu);
-        run_vertical_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
+        run_vertical_tiled_kernel(in1, in2, out_gpu, height, width, window_size, block_size, device_prop.maxThreadsPerBlock);
         checkResults(out_gpu, out_cpu);
-        run_pitched_tiled_kernel(in1, in2, out_gpu, height, width, window_size, max_block_size, device_prop.maxThreadsPerBlock);
+        run_pitched_tiled_kernel(in1, in2, out_gpu, height, width, window_size, block_size, device_prop.maxThreadsPerBlock);
         checkResults(out_gpu, out_cpu);
     }
 
     // Write out the visualization and clean up
-    write_JPEG_file(argv[4], out_gpu, JPEG_OUTPUT_QUALITY);
+    write_JPEG_file(argv[5], out_gpu, JPEG_OUTPUT_QUALITY);
     destroy_frame(raw_in1);
     destroy_frame(raw_in2);
     free_2d_float_array(in1, height);

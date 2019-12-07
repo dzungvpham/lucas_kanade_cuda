@@ -247,7 +247,7 @@ void destroy_frame(frame_ptr kill_me) {
 #define G_GRAYSCALE 0.7152
 #define B_GRAYSCALE 0.0722
 #define TWO_PI (CUDART_PI_F * 2)
-#define EIGEN_THRESHOLD 0.01
+#define EIGEN_THRESHOLD 0.02
 #define NUM_RUN 10
 #define USE_PITCH 0
 #define MEASURE_CPU_TIME 0
@@ -380,26 +380,22 @@ inline __host__ __device__ int divide_up(int a, int b) {
 inline __host__ __device__ float2 calc_flow_from_matrix(
     float AtA_00, float AtA_01, float AtA_11, float Atb_0, float Atb_1
 ) {
-     // Calculate determinant and make sure it is not 0 in order for the matrix to be invertible
+     // Calculate determinant and make sure it's not too small in order for the matrix to be invertible
     float det = AtA_00 * AtA_11 - AtA_01 * AtA_01;
-    if (det == 0.0f) {
+    if (abs(det) <= 1.5e-5) { // 1.5e-5 is based on 1/(255*255)
         return make_float2(0.0f, 0.0f);
     }
 
-    // Calculate the eigenvalues of A^T A and make sure they are > threshold
-    float trace_half = (AtA_00 + AtA_11) / 2.0f; // Half of the trace of A^T A
-    float delta = sqrt(trace_half * trace_half - det);
-    float eigen1 = trace_half + delta;
-    float eigen2 = trace_half - delta;
-    if (eigen1 <= EIGEN_THRESHOLD || eigen2 <= EIGEN_THRESHOLD) {
+    // Calculate the smaller eigenvalue of A^T A and make sure it is > threshold
+    float trace = AtA_00 + AtA_11; // Trace of A^T A
+    float twice_delta = sqrtf(trace * trace - 4.0f * det); // Delta times 2
+    if (isnan(twice_delta) || // Must check if delta is NA or not due to numerical issue with sqrt
+        trace - twice_delta <= EIGEN_THRESHOLD) {  // comparing the smaller eigen value (multiplied by 2)
         return make_float2(0.0f, 0.0f);
     }
 
     // Calculate flow components
-    return make_float2(
-        AtA_11 * Atb_0 - AtA_01 * Atb_1,
-        -AtA_01 * Atb_0 + AtA_00 * Atb_1
-    ) / det;
+    return make_float2(AtA_11*Atb_0 - AtA_01*Atb_1, -AtA_01*Atb_0 + AtA_00*Atb_1) / det;
 }
 
 /**
@@ -1092,19 +1088,19 @@ int main(int argc, char **argv) {
         );
         checkResults(out_gpu, out_cpu);
 
-        // run_tiled_kernel(
-        //     in1, in2, out_gpu,
-        //     height, width, window_size, block_size,
-        //     device_prop.maxThreadsPerBlock, USE_PITCH, false // Horizontal tile
-        // );
-        // checkResults(out_gpu, out_cpu);
-        //
-        // run_tiled_kernel(
-        //     in1, in2, out_gpu,
-        //     height, width, window_size, block_size,
-        //     device_prop.maxThreadsPerBlock, USE_PITCH, true // Vertical tile
-        // );
-        // checkResults(out_gpu, out_cpu);
+        run_tiled_kernel(
+            fx, fy, ft, out_gpu,
+            height, width, window_size, block_size,
+            device_prop.maxThreadsPerBlock, USE_PITCH, false // Horizontal tile
+        );
+        checkResults(out_gpu, out_cpu);
+
+        run_tiled_kernel(
+            fx, fy, ft, out_gpu,
+            height, width, window_size, block_size,
+            device_prop.maxThreadsPerBlock, USE_PITCH, true // Vertical tile
+        );
+        checkResults(out_gpu, out_cpu);
     }
     printf("Finished!\n");
 

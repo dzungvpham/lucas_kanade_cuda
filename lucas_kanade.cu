@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <cuda_runtime.h>
 #include <helper_cuda.h>
 #include <helper_math.h>
@@ -249,6 +250,7 @@ void destroy_frame(frame_ptr kill_me) {
 #define EIGEN_THRESHOLD 0.01
 #define NUM_RUN 10
 #define USE_PITCH 0
+#define MEASURE_CPU_TIME 1
 
 /**
  * Makes sure the two input frames have the same dimensions
@@ -567,19 +569,24 @@ void create_flow_visualization(
  * @param in1 Frame at time t
  * @param in2 Frame at time t + 1
  * @param window_size An odd positive integer >= 3 for the window size
- * @return A frame for visualizing the optical flow.
+ * @return Time needed to calculate flow only
  */
-void uniprocessor_lucas_kanade(
+float uniprocessor_lucas_kanade(
     float **in1, float **in2, frame_ptr out,
     int height, int width, int window_size
 ) {
-    // Calculate derivatives
-    float **fx, **fy, **ft;
-    fx = alloc_2d_float_array(height, width);
-    fy = alloc_2d_float_array(height, width);
-    ft = alloc_2d_float_array(height, width);
+    // Allocate the derivative matrices and the flow matrices (represented by angle and magnitude)
+    float **fx = alloc_2d_float_array(height, width);
+    float **fy = alloc_2d_float_array(height, width);
+    float **ft = alloc_2d_float_array(height, width);
+    float *angle = alloc_1d_float_array(height * width);
+    float *mag = alloc_1d_float_array(height * width);
+    float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1;
+    float2 flow;
+    int s = window_size / 2;
+    int row, col, i, j;
 
-    int row, col;
+    // Calculate derivatives
     for (row = 0; row < height; row++) {
         for (col = 0; col < width; col++) {
             if (row > 0 && row < height - 1 && col > 0 && col < width - 1) {
@@ -594,14 +601,8 @@ void uniprocessor_lucas_kanade(
         }
     }
 
-    // Calculate flows
-    int i, j;
-    float *angle = alloc_1d_float_array(height * width);
-    float *mag = alloc_1d_float_array(height * width);
-    float AtA_00, AtA_01, AtA_11, Atb_0, Atb_1;
-    float2 flow;
-    int s = window_size / 2;
-
+    // Calculate flow
+    clock_t start_clock = clock();
     for (row = s; row < height - s; row++) {
         for (col = s; col < width - s; col++) {
             AtA_00 = AtA_01 = AtA_11 = Atb_0 = Atb_1 = 0.0f;
@@ -621,6 +622,8 @@ void uniprocessor_lucas_kanade(
             mag[row * width + col] = get_magnitude(flow);
         }
     }
+    clock_t end_clock = clock();
+    float ms_taken = (end_clock - start_clock) * 1000 / CLOCKS_PER_SEC;
 
     // Create and write to output frame
     create_flow_visualization(out, angle, mag, height, width, s);
@@ -631,6 +634,8 @@ void uniprocessor_lucas_kanade(
     free_2d_float_array(ft, height);
     free(angle);
     free(mag);
+
+    return ms_taken;
 }
 
 // ---------- Generic CUDA kernel code -----------
@@ -1101,7 +1106,7 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    printf("Running with block size %d and window size %d\n", block_size, window_size);
+    printf("Block size %d | Window size %d\n", block_size, window_size);
 
     // Check input frames
     frame_ptr raw_in1 = read_JPEG_file(argv[3]);
@@ -1119,9 +1124,20 @@ int main(int argc, char **argv) {
     frame_ptr out_cpu = allocate_frame(height, width, 3);
 
     // Run CPU version
-    uniprocessor_lucas_kanade(in1, in2, out_cpu, height, width, window_size);
+    printf("Running CPU version... ");
+    if (MEASURE_CPU_TIME) {
+        float total_cpu_ms = 0.0f;
+        for (int i = 0; i < NUM_RUN; i++) {
+            total_cpu_ms += uniprocessor_lucas_kanade(in1, in2, out_cpu, height, width, window_size);
+        }
+        printf("Average time for CPU: %f ms\n", total_cpu_ms / (float) NUM_RUN);
+    } else {
+        uniprocessor_lucas_kanade(in1, in2, out_cpu, height, width, window_size);
+    }
+    printf("Finished!\n");
 
     // Run GPU version several times for profiler while also testing against CPU version
+    printf("Running GPU version... ");
     for (int i = 0; i < NUM_RUN; i++) {
         run_simple_kernel(
             in1, in2, out_gpu,
@@ -1143,6 +1159,7 @@ int main(int argc, char **argv) {
         );
         checkResults(out_gpu, out_cpu);
     }
+    printf("Finished!\n");
 
     // Write out the visualization and clean up
     write_JPEG_file(argv[5], out_gpu, JPEG_OUTPUT_QUALITY);

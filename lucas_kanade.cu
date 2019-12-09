@@ -1,5 +1,11 @@
 /**
  * (c) 2019 Dzung Pham
+ *
+ * This program contains the CUDA C code for computing optical flow using
+ * the single-pass Lucas-Kanade method
+ *
+ * To run, type:
+ * lucas_kanade <WINDOW_SIZE> <BLOCK_SIZE> <PATH_TO_FRAME_1> <PATH_TO_FRAME_2> <PATH_TO_FLOW_OUTPUT>
  */
 
 #include <math.h>
@@ -14,7 +20,9 @@
 #include <helper_math.h>
 #include "jpeglib.h"
 
-// ----------------------- Helper code ------------------------
+// ----------------------- JPEG Helper code ------------------------
+
+#define JPEG_OUTPUT_QUALITY 75
 
 /*
  * IMAGE DATA FORMATS:
@@ -239,18 +247,24 @@ void destroy_frame(frame_ptr kill_me) {
     #define forceinline inline
 #endif
 
+// Unit constants
 #define BYTE_PER_KB 1024
 #define BYTE_PER_MB 1048576
-#define RUN_TEST 0 // Whether or not to test against uniprocessor
-#define JPEG_OUTPUT_QUALITY 75
+
+// Constants for converting RGB to grayscale
 #define R_GRAYSCALE 0.2126
 #define G_GRAYSCALE 0.7152
 #define B_GRAYSCALE 0.0722
+
+// Math constants
 #define TWO_PI (CUDART_PI_F * 2)
-#define EIGEN_THRESHOLD 0.02
-#define NUM_RUN 10
-#define USE_PITCH 0
-#define MEASURE_CPU_TIME 0
+#define EIGEN_THRESHOLD 0.02 // For checking the eigenvalue in the flow computation
+
+// Run configuration constants
+#define NUM_RUN 10 // Number of times to run the different GPU kernels for nvprof
+#define RUN_TEST 0 // Whether or not to test against uniprocessor
+#define MEASURE_CPU_TIME 0 // Whether or not to measure the cpu time
+#define USE_PITCH 0 // Whether or not to run the kernel with pitch
 
 /**
  * Makes sure the two input frames have the same dimensions
@@ -272,16 +286,17 @@ void checkFrameDim(frame_ptr f1, frame_ptr f2) {
 void checkResults(frame_ptr f1, frame_ptr f2) {
     checkFrameDim(f1, f2);
     int i, j, k;
+    JSAMPLE j1, j2;
 
     for (i = 0; i < f1->image_height; i++){
         for (j = 0; j < f1->image_width; j++){
             for (k = 0; k < f1->num_channels; k++){
-                JSAMPLE j1 = f1->row_pointers[i][(f1->num_channels) * j + k];
-                JSAMPLE j2 = f2->row_pointers[i][(f2->num_channels) * j + k];
-                if (abs(j1 - j2) > 1) {
+                j1 = f1->row_pointers[i][(f1->num_channels) * j + k];
+                j2 = f2->row_pointers[i][(f2->num_channels) * j + k];
+                if (abs(j1 - j2) > 1) { // Values between CPU and GPU can sometimes differ by 1
                     fprintf(stderr, "Values do not match at (%d, %d, %d) \n", i, j, k);
-                    fprintf(stderr, "in %d\n", j1);
-                    fprintf(stderr, "to %d\n", j2);
+                    fprintf(stderr, "Frame 1: %d\n", j1);
+                    fprintf(stderr, "Frame 2: %d\n", j2);
                     exit(EXIT_FAILURE);
                 }
             }
@@ -291,7 +306,7 @@ void checkResults(frame_ptr f1, frame_ptr f2) {
 
 /**
  * Queries the properties of the GPU device with the given device_id,
- * fills it in the given device_prop, and print interesting info
+ * fills it in the given device_prop, and prints interesting info
  *
  * @param device_prop The cuda device properties struct
  * @param device_id The id of the gpu device
@@ -441,7 +456,7 @@ void free_2d_float_array(float **arr, int height) {
 }
 
 /**
- * Normalize RGB frame and grayscale if necessary
+ * Normalize RGB frame to be between 0 and 1, and grayscale if necessary
  */
 float** get_normalized_2d_float_array(frame_ptr in) {
     int height = in->image_height, width = in->image_width;
@@ -518,15 +533,21 @@ void print_1d_float_array_as_2d(float *arr, int height, int width) {
 
 /**
  * Visualize the flow matrix using HSV and convert to RGB.
+ *
+ * @param out The output frame
+ * @param angle The angle of the flows
+ * @param mag The magnitude of the flows
+ * @param height Height of frame
+ * @param width Width of frame
+ * @param s Floor of window size / 2
  */
 void create_flow_visualization(
     frame_ptr out, float *angle, float *mag,
     int height, int width, int s
 ) {
+    // Find min and max magnitude
     float cur_mag, max_mag = -INFINITY, min_mag = INFINITY;
     int row, col;
-
-    // Find min and max magnitude
     for (row = s; row < height - s; row++) {
         for (col = s; col < width - s; col++) {
             cur_mag = mag[row * width + col];
@@ -542,6 +563,7 @@ void create_flow_visualization(
         return;
     }
 
+    // Convert angle & magnitude to RGB
     JSAMPLE *cur_row;
     max_mag -= min_mag;
     for (row = s; row < height - s; row++) {
@@ -559,6 +581,17 @@ void create_flow_visualization(
     }
 }
 
+/**
+ * Calculates the spatial derivative fx and fy and the temporal derivative ft
+ * from two frames using the Prewitt operator (without dividng by 3)
+ *
+ * @param in1 Frame 1
+ * @param in2 Frame 2
+ * @param fx Horizontal spatial derivative
+ * @param fy Vertical spatial derivative
+ * @param ft Temporal derivative
+ * @param height, width Height and width of frame
+ */
 void calculate_derivative(
     float **in1, float **in2,
     float *fx, float *fy, float *ft,
@@ -586,7 +619,9 @@ void calculate_derivative(
 /**
  * Calculate optical flow with Lucas-Kanade using CPU from 2 normalized frames
  *
- * @param fx, fy, ft The erivatives
+ * @param fx, fy, ft The derivatives
+ * @param out Output frame for visualization
+ * @param height, width Height and width of input
  * @param window_size An odd positive integer >= 3 for the window size
  * @return Time needed to calculate flow only
  */
@@ -627,7 +662,7 @@ float uniprocessor_lucas_kanade(
     clock_t end_clock = clock();
     float ms_elapsed = (end_clock - start_clock) * 1000 / CLOCKS_PER_SEC;
 
-    // Create and write to output frame
+    // Create visualization and write to output frame
     create_flow_visualization(out, angle, mag, height, width, s);
 
     // Clean up
@@ -637,115 +672,11 @@ float uniprocessor_lucas_kanade(
     return ms_elapsed;
 }
 
-// ---------- Generic CUDA kernel code -----------
-
-void run_generic_cuda_kernel(
-    float *fx, float *fy, float *ft, frame_ptr out,
-    int height, int width, int window_size,
-    dim3 flow_grid_dim, dim3 flow_block_dim,
-    void (*normal_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int),
-    void (*tiled_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int, int, int, int, int, int),
-    bool is_tiled, int out_block_size, int in_block_size, size_t shared_mem_size,
-    int tile_height, int tile_width, int num_tile
-) {
-    int s = window_size / 2;
-    size_t size = height * width * sizeof(float);
-    float *angle, *mag, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
-
-    checkCudaErrors(cudaMalloc((void **) &d_fx, size));
-    checkCudaErrors(cudaMalloc((void **) &d_fy, size));
-    checkCudaErrors(cudaMalloc((void **) &d_ft, size));
-    checkCudaErrors(cudaMemcpy(d_fx, fx, size, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_fy, fy, size, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(d_ft, ft, size, cudaMemcpyHostToDevice));
-
-    angle = alloc_1d_float_array(size);
-    mag = alloc_1d_float_array(size);
-    checkCudaErrors(cudaMalloc((void **) &d_angle, size));
-    checkCudaErrors(cudaMalloc((void **) &d_mag, size));
-    checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
-    checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
-
-    if (is_tiled) {
-        tiled_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim, shared_mem_size>>>(
-            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, width, s,
-            out_block_size, in_block_size, tile_height, tile_width, num_tile
-        );
-    } else {
-        normal_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim>>>(
-            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, width, s
-        );
-    }
-
-    checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
-    create_flow_visualization(out, angle, mag, height, width, s);
-
-    free(angle);
-    free(mag);
-    checkCudaErrors(cudaFree(d_fx));
-    checkCudaErrors(cudaFree(d_fy));
-    checkCudaErrors(cudaFree(d_ft));
-    checkCudaErrors(cudaFree(d_angle));
-    checkCudaErrors(cudaFree(d_mag));
-}
-
-void run_generic_pitched_cuda_kernel(
-    float *fx, float *fy, float *ft, frame_ptr out,
-    int height, int width, int window_size,
-    dim3 flow_grid_dim, dim3 flow_block_dim,
-    void (*normal_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int),
-    void (*tiled_lucas_kanade_kernel_ptr)(float *, float *, float *, float *, float *, int, int, int, int, int, int, int, int, int),
-    bool is_tiled, int out_block_size, int in_block_size, size_t shared_mem_size,
-    int tile_height, int tile_width, int num_tile
-) {
-    int s = window_size / 2;
-    size_t pitch;
-    size_t width_in_bytes = width * sizeof(float);
-    float *angle, *mag, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
-
-    checkCudaErrors(cudaMallocPitch((void **) &d_fx, &pitch, width_in_bytes, height));
-    checkCudaErrors(cudaMallocPitch((void **) &d_fy, &pitch, width_in_bytes, height));
-    checkCudaErrors(cudaMallocPitch((void **) &d_ft, &pitch, width_in_bytes, height));
-    checkCudaErrors(cudaMemcpy2D(d_fx, pitch, fx, width_in_bytes, width_in_bytes, height, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy2D(d_fy, pitch, fy, width_in_bytes, width_in_bytes, height, cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy2D(d_ft, pitch, ft, width_in_bytes, width_in_bytes, height, cudaMemcpyHostToDevice));
-
-    angle = alloc_1d_float_array(height * width_in_bytes);
-    mag = alloc_1d_float_array(height * width_in_bytes);
-    checkCudaErrors(cudaMallocPitch((void **) &d_angle, &pitch, width_in_bytes, height));
-    checkCudaErrors(cudaMallocPitch((void **) &d_mag, &pitch, width_in_bytes, height));
-    checkCudaErrors(cudaMemset((void *) d_angle, 0, height * pitch));
-    checkCudaErrors(cudaMemset((void *) d_mag, 0, height * pitch));
-
-    int pitch_float = divide_up((int) pitch, (int) sizeof(float)); // number of pictched floats
-
-    if (is_tiled) {
-        tiled_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim, shared_mem_size>>>(
-            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, pitch_float, s,
-            out_block_size, in_block_size, tile_height, tile_width, num_tile
-        );
-    } else {
-        normal_lucas_kanade_kernel_ptr<<<flow_grid_dim, flow_block_dim>>>(
-            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, pitch_float, s
-        );
-    }
-
-    checkCudaErrors(cudaMemcpy2D(angle, width_in_bytes, d_angle, pitch, width_in_bytes, height, cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy2D(mag, width_in_bytes, d_mag, pitch, width_in_bytes, height, cudaMemcpyDeviceToHost));
-    create_flow_visualization(out, angle, mag, height, width, s);
-
-    free(angle);
-    free(mag);
-    checkCudaErrors(cudaFree(d_fx));
-    checkCudaErrors(cudaFree(d_fy));
-    checkCudaErrors(cudaFree(d_ft));
-    checkCudaErrors(cudaFree(d_angle));
-    checkCudaErrors(cudaFree(d_mag));
-}
-
 // --------- CUDA Kernel code ------------
 
+/**
+ * A simple GPU kernel with no tiling
+ */
 __global__ void simple_lucas_kanade_kernel(
     float *fx, float *fy, float *ft, float *angle, float *mag,
     int height, int width, int pitch, int s
@@ -779,7 +710,7 @@ __global__ void simple_lucas_kanade_kernel(
 }
 
 /**
- * blockDim.x is the tile's width, and its square is the number of floats
+ * The normal (horiztonal) tiled GPU kernel
  */
 __global__ void tiled_lucas_kanade_kernel(
     float *fx, float *fy, float *ft, float *angle, float *mag,
@@ -850,6 +781,9 @@ __global__ void tiled_lucas_kanade_kernel(
     }
 }
 
+/**
+ * The vertical tiled GPU kernel
+ */
 __global__ void vertical_tiled_lucas_kanade_kernel(
     float *fx, float *fy, float *ft, float *angle, float *mag,
     int height, int width, int pitch, int s, int out_block_size, int in_block_size,
@@ -921,88 +855,222 @@ __global__ void vertical_tiled_lucas_kanade_kernel(
 
 // ----- Run kernel code -----
 
+// Function type for the simple flow kernel
+typedef void (*simple_flow_kernel_t)(
+    float *, float *, float *, float *, float *,
+    int, int, int, int
+);
+
+// Function type for the tiled flow kernel
+typedef void (*tiled_flow_kernel_t)(
+    float *, float *, float *, float *, float *,
+    int, int, int, int, int, int, int, int, int
+);
+
+/**
+ * This function manages the memory and grid/block configuration
+ * for both simple and tiled GPU kernels, pitch or no pitch.
+ * Then, it executes the appropriate kernel and creates visualization.
+ *
+ * @param fx, fy, ft The derivatives
+ * @param out The output frame for visualization
+ * @param grid_dim, block_dim The grid and block dimension for the kernel
+ * @param simple_flow_kernel, tiled_flow_kernel The function pointer to the kernel to run
+ * @param is_tiled Whether to run the simple kernel or the tiled kernel
+ * @param use_pitch Whether or not to use pitch memory allocation
+ * @param out_block_size, in_block_size Size of output and input block
+ * @param shared_mem_size Total shared memory to allocate
+ * @param tile_height, tile_width Dimensions of the tile
+ * @param num_tile Number of tiles per block
+ */
+void run_generic_flow_kernel(
+    float *fx, float *fy, float *ft, frame_ptr out,
+    int height, int width, int window_size,
+    dim3 grid_dim, dim3 block_dim,
+    simple_flow_kernel_t simple_flow_kernel, tiled_flow_kernel_t tiled_flow_kernel,
+    bool is_tiled, bool use_pitch,
+    int out_block_size, int in_block_size, size_t shared_mem_size,
+    int tile_height, int tile_width, int num_tile
+) {
+    // Allocate and set GPU memory for fx, fy, ft, angle and mag
+    int s = window_size / 2;
+    size_t pitch_bytes;
+    int pitch_floats;
+    size_t width_in_bytes = width * sizeof(float);
+    size_t size = height * width_in_bytes;
+    float *angle, *mag, *d_fx, *d_fy, *d_ft, *d_angle, *d_mag;
+    angle = alloc_1d_float_array(size);
+    mag = alloc_1d_float_array(size);
+
+    if (use_pitch) {
+        checkCudaErrors(cudaMallocPitch((void **) &d_fx, &pitch_bytes, width_in_bytes, height));
+        checkCudaErrors(cudaMallocPitch((void **) &d_fy, &pitch_bytes, width_in_bytes, height));
+        checkCudaErrors(cudaMallocPitch((void **) &d_ft, &pitch_bytes, width_in_bytes, height));
+        checkCudaErrors(cudaMallocPitch((void **) &d_angle, &pitch_bytes, width_in_bytes, height));
+        checkCudaErrors(cudaMallocPitch((void **) &d_mag, &pitch_bytes, width_in_bytes, height));
+
+        checkCudaErrors(cudaMemcpy2D(
+            d_fx, pitch_bytes, fx, width_in_bytes,
+            width_in_bytes, height, cudaMemcpyHostToDevice
+        ));
+        checkCudaErrors(cudaMemcpy2D(
+            d_fy, pitch_bytes, fy, width_in_bytes,
+            width_in_bytes, height, cudaMemcpyHostToDevice
+        ));
+        checkCudaErrors(cudaMemcpy2D(
+            d_ft, pitch_bytes, ft, width_in_bytes,
+            width_in_bytes, height, cudaMemcpyHostToDevice
+        ));
+        checkCudaErrors(cudaMemset((void *) d_angle, 0, height * pitch_bytes));
+        checkCudaErrors(cudaMemset((void *) d_mag, 0, height * pitch_bytes));
+
+        pitch_floats = divide_up((int) pitch_bytes, (int) sizeof(float));
+
+    } else {
+        checkCudaErrors(cudaMalloc((void **) &d_fx, size));
+        checkCudaErrors(cudaMalloc((void **) &d_fy, size));
+        checkCudaErrors(cudaMalloc((void **) &d_ft, size));
+        checkCudaErrors(cudaMalloc((void **) &d_angle, size));
+        checkCudaErrors(cudaMalloc((void **) &d_mag, size));
+
+        checkCudaErrors(cudaMemcpy(d_fx, fx, size, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_fy, fy, size, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy(d_ft, ft, size, cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemset((void *) d_angle, 0, size));
+        checkCudaErrors(cudaMemset((void *) d_mag, 0, size));
+
+        pitch_floats = width;
+    }
+
+    // Execute kernel
+    if (is_tiled) {
+        tiled_flow_kernel<<<grid_dim, block_dim, shared_mem_size>>>(
+            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, pitch_floats, s,
+            out_block_size, in_block_size, tile_height, tile_width, num_tile
+        );
+    } else {
+        simple_flow_kernel<<<grid_dim, block_dim>>>(
+            d_fx, d_fy, d_ft, d_angle, d_mag, height, width, pitch_floats, s
+        );
+    }
+
+    // Copy result to host's memory and make visualization
+    if (use_pitch) {
+        checkCudaErrors(cudaMemcpy2D(
+            angle, width_in_bytes, d_angle, pitch_bytes,
+            width_in_bytes, height, cudaMemcpyDeviceToHost
+        ));
+        checkCudaErrors(cudaMemcpy2D(
+            mag, width_in_bytes, d_mag, pitch_bytes,
+            width_in_bytes, height, cudaMemcpyDeviceToHost
+        ));
+    } else {
+        checkCudaErrors(cudaMemcpy(angle, d_angle, size, cudaMemcpyDeviceToHost));
+        checkCudaErrors(cudaMemcpy(mag, d_mag, size, cudaMemcpyDeviceToHost));
+    }
+
+    create_flow_visualization(out, angle, mag, height, width, s);
+
+    // Clean up
+    free(angle);
+    free(mag);
+    checkCudaErrors(cudaFree(d_fx));
+    checkCudaErrors(cudaFree(d_fy));
+    checkCudaErrors(cudaFree(d_ft));
+    checkCudaErrors(cudaFree(d_angle));
+    checkCudaErrors(cudaFree(d_mag));
+}
+
+/**
+ * This function sets up the grid/block dimensions for the simple flow kernel
+ * then calls the generic kernel with the appropriate flow kernel
+ *
+ * @param fx, fy, ft The derivatives
+ * @param out Output frame for visualization
+ * @param height, width Dimension of the inputs
+ * @param window_size Window size
+ * @param block_size Block size for the kernel
+ * @param use_pitch Whether or not to run the pitched kernel
+ */
 void run_simple_kernel(
     float *fx, float *fy, float *ft, frame_ptr out,
     int height, int width, int window_size, int block_size, bool use_pitch
 ) {
+    // Configures grid and block dimensions
     int out_width = width - window_size + 1;
     int out_height = height - window_size + 1;
     dim3 block_dim(block_size, block_size, 1);
-    dim3 flow_grid_dim(divide_up(out_width, block_size), divide_up(out_height, block_size), 1);
+    dim3 grid_dim(divide_up(out_width, block_size), divide_up(out_height, block_size), 1);
 
-    if (use_pitch) {
-        run_generic_pitched_cuda_kernel(
-            fx, fy, ft, out, height, width, window_size,
-            flow_grid_dim, block_dim,
-            simple_lucas_kanade_kernel, NULL, false,
-            0, 0, 0, 0, 0, 0
-        );
-    } else {
-        run_generic_cuda_kernel(
-            fx, fy, ft, out, height, width, window_size,
-            flow_grid_dim, block_dim,
-            simple_lucas_kanade_kernel, NULL, false,
-            0, 0, 0, 0, 0, 0
-        );
-    }
+    // Choose kernel to execute
+    run_generic_flow_kernel(
+        fx, fy, ft, out, height, width, window_size,
+        grid_dim, block_dim,
+        simple_lucas_kanade_kernel, NULL, false, use_pitch,
+        0, 0, 0, 0, 0, 0
+    );
 }
 
+/**
+ * This function sets up the grid/block dimensions for the tiled flow kernel
+ * then calls the generic tiled kernel with the appropriate flow kernel
+ *
+ * @param fx, fy, ft The derivatives
+ * @param out Output frame for visualization
+ * @param height, width Dimension of the inputs
+ * @param window_size Window size
+ * @param block_size Block size for the kernel
+ * @param out_block_size Size of output block
+ * @param max_threads_per_block Maxinum # of threads per block from the device properties
+ * @param use_pitch Whether or not to run the pitched kernel
+ * @param vertical Whether or not to run the vertical tile version
+ */
 void run_tiled_kernel(
     float *fx, float *fy, float *ft, frame_ptr out,
     int height, int width, int window_size,
     int out_block_size, int max_threads_per_block, bool use_pitch, bool vertical
 ) {
-    // Grid, block dim, tile dim, and shared mem size for the tiled flow kernel
+    // Configures tile, grid and block dimensions
     int in_block_size = out_block_size + window_size - 1;
+    int smaller_tile_dim = min(in_block_size, max_threads_per_block / in_block_size); // The smaller dimension
+    tiled_flow_kernel_t tiled_flow_kernel;
+    int tile_height, tile_width;
+    if (vertical) {
+        tiled_flow_kernel = vertical_tiled_lucas_kanade_kernel;
+        tile_height = in_block_size;
+        tile_width = smaller_tile_dim;
+    } else {
+        tiled_flow_kernel = tiled_lucas_kanade_kernel;
+        tile_height = smaller_tile_dim;
+        tile_width = in_block_size;
+    }
+    dim3 block_dim(tile_width, tile_height, 1);
+    int num_tile = divide_up(in_block_size, smaller_tile_dim);
     int out_width = width - window_size + 1;
     int out_height = height - window_size + 1;
-    dim3 flow_grid_dim(divide_up(out_width, out_block_size), divide_up(out_height, out_block_size), 1);
+    dim3 grid_dim(divide_up(out_width, out_block_size), divide_up(out_height, out_block_size), 1);
     size_t shared_mem_size = 3 * in_block_size * in_block_size * sizeof(float); // reserve shared mem for fx, fy, ft
-    int tile_dim = min(in_block_size, max_threads_per_block / in_block_size); // The smaller dimension
-    int num_tile = divide_up(in_block_size, tile_dim);
 
-    if (vertical) {
-        dim3 flow_block_dim(tile_dim, in_block_size, 1);
-        if (use_pitch) {
-            run_generic_pitched_cuda_kernel(
-                fx, fy, ft, out, height, width, window_size,
-                flow_grid_dim, flow_block_dim,
-                NULL, vertical_tiled_lucas_kanade_kernel, true,
-                out_block_size, in_block_size, shared_mem_size, in_block_size, tile_dim, num_tile
-            );
-        } else {
-            run_generic_cuda_kernel(
-                fx, fy, ft, out, height, width, window_size,
-                flow_grid_dim, flow_block_dim,
-                NULL, vertical_tiled_lucas_kanade_kernel, true,
-                out_block_size, in_block_size, shared_mem_size, in_block_size, tile_dim, num_tile
-            );
-        }
-    } else {
-        dim3 flow_block_dim(in_block_size, tile_dim, 1);
-        if (use_pitch) {
-            run_generic_pitched_cuda_kernel(
-                fx, fy, ft, out, height, width, window_size,
-                flow_grid_dim, flow_block_dim,
-                NULL, tiled_lucas_kanade_kernel, true,
-                out_block_size, in_block_size, shared_mem_size, tile_dim, in_block_size, num_tile
-            );
-        } else {
-            run_generic_cuda_kernel(
-                fx, fy, ft, out, height, width, window_size,
-                flow_grid_dim, flow_block_dim,
-                NULL, tiled_lucas_kanade_kernel, true,
-                out_block_size, in_block_size, shared_mem_size, tile_dim, in_block_size, num_tile
-            );
-        }
-    }
+    // Choose kernel to execute
+    run_generic_flow_kernel(
+        fx, fy, ft, out, height, width, window_size,
+        grid_dim, block_dim,
+        NULL, tiled_flow_kernel, true, use_pitch,
+        out_block_size, in_block_size, shared_mem_size,
+        tile_height, tile_width, num_tile
+    );
 }
 
+/**
+ * Calculate max window size for tiling
+ * @param device_prop GPU device properties
+ * @param out_block_size Size of the output block
+ */
 size_t calc_max_window_size(cudaDeviceProp *device_prop, int out_block_size) {
     // Maximum number of floats per shared mem array (fx, fy, ft)
     int max_float_num = device_prop->sharedMemPerBlock / sizeof(float) / 3;
     int max_window_size = ((int) floor(sqrt(max_float_num))) - out_block_size + 1;
-    return max_window_size % 2 == 1 ? max_window_size : max_window_size - 1;
+    return max_window_size % 2 == 1 ? max_window_size : max_window_size - 1; // Make sure it's odd
 }
 
 // ----------- Host main --------------
@@ -1049,6 +1117,10 @@ int main(int argc, char **argv) {
     frame_ptr raw_in1 = read_JPEG_file(argv[3]);
     frame_ptr raw_in2 = read_JPEG_file(argv[4]);
     checkFrameDim(raw_in1, raw_in2);
+    if (raw_in1->num_channels != 1 && raw_in1->num_channels != 3) { // in1 and in2 has same # of channels
+        fprintf(stderr, "Input frame must have either 1 or 3 channels\n");
+        exit(EXIT_FAILURE);
+    }
 
     // Create 2d array of normalized image pixel between [0, 1]
     int height = raw_in1->image_height;

@@ -5,9 +5,15 @@
  * the single-pass Lucas-Kanade method
  *
  * To run, type:
- * lucas_kanade <WINDOW_SIZE> <BLOCK_SIZE> <PATH_TO_FRAME_1> <PATH_TO_FRAME_2> <PATH_TO_FLOW_OUTPUT>
+ * lucas_kanade <WINDOW_SIZE> <BLOCK_SIZE> <PATH_TO_FRAME_1> <PATH_TO_FRAME_2> <PATH_TO_FLOW_VISUALIZATION>
+ *
+ * Example:
+ * lucas_kanade 25 32 input/sphere_big_odd/frame_0.jpg input/sphere_big_odd/frame_1.jpg out.jpg
  */
 
+#include <cuda_runtime.h>
+#include <helper_cuda.h>
+#include <helper_math.h>
 #include <math.h>
 #include <math_constants.h> // CUDA Math constants
 #include <stdbool.h>
@@ -15,9 +21,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <cuda_runtime.h>
-#include <helper_cuda.h>
-#include <helper_math.h>
 #include "jpeglib.h"
 
 // ----------------------- JPEG Helper code ------------------------
@@ -261,9 +264,12 @@ void destroy_frame(frame_ptr kill_me) {
 #define EIGEN_THRESHOLD 0.02 // For checking the eigenvalue in the flow computation
 
 // Run configuration constants
-#define NUM_RUN 10 // Number of times to run the different GPU kernels for nvprof
+#define NUM_RUN 1 // Number of times to run the different GPU kernels for nvprof
 #define RUN_TEST 0 // Whether or not to test against uniprocessor
 #define MEASURE_CPU_TIME 0 // Whether or not to measure the cpu time
+#define RUN_SIMPLE_GPU_KERNEL 0 // Whether or not to run the simple GPU kernel
+#define RUN_HORIZ_TILED_GPU_KERNEL 1 // Whether or not to run the horizontal tiled GPU kernel
+#define RUN_VERT_TILED_GPU_KERNEL 0 // Whether or not to run the vertical tiled GPU kernel
 #define USE_PITCH 0 // Whether or not to run the kernel with pitch
 
 /**
@@ -710,7 +716,7 @@ __global__ void simple_lucas_kanade_kernel(
 }
 
 /**
- * The normal (horiztonal) tiled GPU kernel
+ * The normal (horizontal) tiled GPU kernel
  */
 __global__ void tiled_lucas_kanade_kernel(
     float *fx, float *fy, float *ft, float *angle, float *mag,
@@ -1079,7 +1085,7 @@ int main(int argc, char **argv) {
     if (argc != 6) {
         fprintf(stderr,
             "Usage: lucas_kanade <WINDOW_SIZE> <BLOCK_SIZE>"
-            " <PATH_TO_FRAME_1> <PATH_TO_FRAME_2> <PATH_TO_FLOW_OUTPUT>\n");
+            " <PATH_TO_FRAME_1> <PATH_TO_FRAME_2> <PATH_TO_FLOW_VISUALIZATION>\n");
         exit(EXIT_FAILURE);
     }
 
@@ -1139,40 +1145,49 @@ int main(int argc, char **argv) {
     frame_ptr out_cpu = allocate_frame(height, width, 3);
 
     // Run CPU version
-    printf("Running CPU version... ");
     if (MEASURE_CPU_TIME) {
+        printf("Running CPU version... ");
         float total_cpu_ms = 0.0f;
         for (int i = 0; i < NUM_RUN; i++) {
             total_cpu_ms += uniprocessor_lucas_kanade(fx, fy, ft, out_cpu, height, width, window_size);
         }
         printf("Average time for CPU: %f ms\n", total_cpu_ms / (float) NUM_RUN);
-    } else {
+        printf("Finished!\n");
+    } else if (RUN_TEST) {
+        printf("Running CPU version... ");
         uniprocessor_lucas_kanade(fx, fy, ft, out_cpu, height, width, window_size);
+        printf("Finished!\n");
     }
-    printf("Finished!\n");
 
     // Run GPU version several times for profiler while also testing against CPU version
     printf("Running GPU version... ");
     for (int i = 0; i < NUM_RUN; i++) {
-        run_simple_kernel(
-            fx, fy, ft, out_gpu,
-            height, width, window_size, block_size, USE_PITCH
-        );
-        checkResults(out_gpu, out_cpu);
+        if (RUN_SIMPLE_GPU_KERNEL) {
+            run_simple_kernel(
+                fx, fy, ft, out_gpu,
+                height, width, window_size, block_size, USE_PITCH
+            );
+            if (RUN_TEST) checkResults(out_gpu, out_cpu);
+        }
 
-        run_tiled_kernel(
-            fx, fy, ft, out_gpu,
-            height, width, window_size, block_size,
-            device_prop.maxThreadsPerBlock, USE_PITCH, false // Horizontal tile
-        );
-        checkResults(out_gpu, out_cpu);
+        if (RUN_VERT_TILED_GPU_KERNEL) {
+            run_tiled_kernel(
+                fx, fy, ft, out_gpu,
+                height, width, window_size, block_size,
+                device_prop.maxThreadsPerBlock, USE_PITCH, true // Vertical tile
+            );
+            if (RUN_TEST) checkResults(out_gpu, out_cpu);
+        }
 
-        run_tiled_kernel(
-            fx, fy, ft, out_gpu,
-            height, width, window_size, block_size,
-            device_prop.maxThreadsPerBlock, USE_PITCH, true // Vertical tile
-        );
-        checkResults(out_gpu, out_cpu);
+        if (RUN_HORIZ_TILED_GPU_KERNEL) {
+            run_tiled_kernel(
+                fx, fy, ft, out_gpu,
+                height, width, window_size, block_size,
+                device_prop.maxThreadsPerBlock, USE_PITCH, false // Horizontal tile
+            );
+            if (RUN_TEST) checkResults(out_gpu, out_cpu);
+        }
+
     }
     printf("Finished!\n");
 
